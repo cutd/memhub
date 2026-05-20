@@ -1,0 +1,5 @@
+# MemHub generated local indexes/caches
+.memhub/cache/
+.memhub/indexes/
+*.db
+.DS_Store

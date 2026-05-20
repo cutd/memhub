@@ -1,0 +1,16 @@
+schema_version: '0.1'
+inbox_id: inbox_20260520_173411_9l1l97
+status: pending
+created_at: '2026-05-20T17:34:11+08:00'
+source:
+  client: hermes
+items:
+- id: mem_20260520_173411_9l1l97
+  type: decision
+  scope: project
+  status: pending
+  content: MemHub Protocol v0.1 已完成初版定义，下一步实现 Hermes Skill MVP。
+  suggested_target: projects/memhub/decisions.yaml
+  confidence: 0.8
+  importance: 0.6
+  created_at: '2026-05-20T17:34:11+08:00'

@@ -1,0 +1,15 @@
+schema_version: '0.1'
+project:
+  id: memhub
+  name: MemHub
+  status: active
+  description: 无服务端、Git 同步、Agent Memory Protocol。
+  goals:
+  - 让多个 AI Agent 共享同一份用户记忆。
+  - 不依赖中心化后端。
+  constraints:
+  - Local-first
+  - Git-first
+  - Agent-oriented
+  current_phase: mvp
+  updated_at: '2026-05-20T17:31:53+08:00'

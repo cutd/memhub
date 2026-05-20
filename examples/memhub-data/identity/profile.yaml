@@ -1,0 +1,24 @@
+schema_version: '0.1'
+updated_at: '2026-05-20T17:31:53+08:00'
+profile:
+  id: user_main
+  name: dateng
+  display_name: dateng
+  language: zh-CN
+  timezone: Asia/Shanghai
+  role: Product Manager
+  company: null
+  bio: ''
+  tags: []
+communication:
+  default_language: zh-CN
+  preferred_style: direct_structured
+  verbosity: medium
+  likes:
+  - 结构化输出
+  - 直接回答
+  - 能落地的方案
+  dislikes:
+  - 空泛表述
+  - 过度道歉
+  - 没有上下文就假装知道

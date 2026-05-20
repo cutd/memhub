@@ -1,0 +1,18 @@
+schema_version: '0.1'
+repo:
+  id: user_main_memhub
+  owner: dateng
+sync:
+  type: git
+  remote: null
+  branch: main
+  auto_pull: true
+  auto_push: true
+  pull_strategy: rebase
+  commit_prefix: 'memhub:'
+inbox:
+  auto_archive: false
+  auto_archive_confidence_threshold: 0.92
+context:
+  default_pack: standard
+  standard_token_budget: 2000

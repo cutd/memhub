@@ -28,6 +28,46 @@ except ImportError as exc:  # pragma: no cover
 SCHEMA_VERSION = "0.1"
 
 
+def parse_dotenv_value(value: str) -> str:
+    value = value.strip()
+    if value and value[0] not in {'\"', "'"} and " #" in value:
+        value = value.split(" #", 1)[0].strip()
+    if len(value) >= 2 and ((value[0] == value[-1] == '\"') or (value[0] == value[-1] == "'")):
+        value = value[1:-1]
+    return value
+
+
+def load_dotenv_files(paths: list[Path]) -> None:
+    """Load simple KEY=VALUE lines from .env files without overriding existing env vars.
+
+    This is intentionally tiny and dependency-free. It supports optional leading
+    `export`, quoted values, blank lines, and comments. It never prints values.
+    """
+    seen: set[Path] = set()
+    for path in paths:
+        path = path.expanduser()
+        if path in seen or not path.exists() or not path.is_file():
+            continue
+        seen.add(path)
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except UnicodeDecodeError:
+            lines = path.read_text(errors="replace").splitlines()
+        for line in lines:
+            text = line.strip()
+            if not text or text.startswith("#"):
+                continue
+            if text.startswith("export "):
+                text = text[len("export "):].strip()
+            if "=" not in text:
+                continue
+            key, value = text.split("=", 1)
+            key = key.strip()
+            if not key or key in os.environ:
+                continue
+            os.environ[key] = parse_dotenv_value(value)
+
+
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -1079,6 +1119,7 @@ def sync_repo(repo: Path) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv_files([Path.cwd() / ".env", Path.home() / ".env"])
     parser = argparse.ArgumentParser(prog="memhub", description="MemHub Protocol v0.1 reference CLI")
     parser.add_argument("--repo", default=os.environ.get("MEMHUB_REPO", "./memhub-data"), help="MemHub repository path")
     sub = parser.add_subparsers(dest="cmd", required=True)

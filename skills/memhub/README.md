@@ -35,7 +35,7 @@ python scripts/memhub.py --repo "$MEMHUB_REPO" init --name dateng --role "Produc
 
 ### GitHub Device Flow
 
-发布版应内置 OAuth App client id；开发版可通过环境变量或参数传入：
+发布版应内置 OAuth App client id；开发版可通过环境变量、home 目录 `.env`、当前目录 `.env` 或参数传入：
 
 ```bash
 export MEMHUB_GITHUB_CLIENT_ID=<github-oauth-app-client-id>

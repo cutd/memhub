@@ -10,14 +10,22 @@
 export MEMHUB_REPO=~/memhub-data
 ```
 
-如果你已经有 Git remote：
+## 配置 GitHub/Gitee 同步
+
+推荐使用产品化 setup 命令，而不是手动配置 remote：
 
 ```bash
-cd ~/memhub-data
-git remote add origin git@github.com:<user>/memhub-data.git
-git branch -M main
-git push -u origin main
+# GitHub：适合海外用户/开发者
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup github --repo-name mymemhub
+
+# Gitee：适合中国大陆用户
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup gitee --repo-name mymemhub
+
+# 如果已经配置好 SSH key，也可以使用 SSH remote
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup github --auth ssh --remote-method ssh --owner <login> --repo-name mymemhub --no-create
 ```
+
+Token 可以通过 `--token`、`MEMHUB_GITHUB_TOKEN`、`MEMHUB_GITEE_TOKEN` 或交互输入提供。Token 会保存在本地 `.memhub/secrets.yaml`，并被 `.gitignore` 忽略。
 
 ## 首次初始化
 
@@ -35,5 +43,8 @@ python scripts/memhub.py --repo "$MEMHUB_REPO" inbox show <filename-or-id-fragme
 python scripts/memhub.py --repo "$MEMHUB_REPO" promote --dry-run
 python scripts/memhub.py --repo "$MEMHUB_REPO" promote --apply
 python scripts/memhub.py --repo "$MEMHUB_REPO" export chatbot
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup github --repo-name mymemhub
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup gitee --repo-name mymemhub
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync status
 python scripts/memhub.py --repo "$MEMHUB_REPO" sync
 ```

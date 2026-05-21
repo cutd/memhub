@@ -7,12 +7,18 @@ Standalone copy of memhub_cli.__main__ for Hermes/OpenClaw skill installs.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
+import getpass
+import json
 import os
 import random
 import string
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -206,7 +212,7 @@ def init_repo(repo: Path, name: str = "user", role: str = "") -> None:
     write_yaml(repo / "relations/tools.yaml", {"schema_version": SCHEMA_VERSION, "tools": []})
     write_yaml(repo / f"timeline/{today_month()}.yaml", {"schema_version": SCHEMA_VERSION, "month": today_month(), "events": []})
 
-    gitignore = """# MemHub generated local indexes/caches\n.memhub/cache/\n.memhub/indexes/\n*.db\n.DS_Store\n"""
+    gitignore = """# MemHub generated local indexes/caches and secrets\n.memhub/cache/\n.memhub/indexes/\n.memhub/secrets.yaml\n.memhub/secrets/\n*.db\n.DS_Store\n"""
     write_text(repo / ".gitignore", gitignore)
 
     commit_all(repo, "memhub: init repository")
@@ -532,6 +538,297 @@ def promote(repo: Path, refs: list[str] | None = None, apply: bool = False, stat
         lines.append("Dry run only. Re-run with --apply to write canonical files and mark inbox items promoted.")
     return "\n".join(lines) + "\n"
 
+
+# --- Sync providers: GitHub / Gitee -------------------------------------------------
+
+PROVIDERS: dict[str, dict[str, str]] = {
+    "github": {
+        "display": "GitHub",
+        "api_base": "https://api.github.com",
+        "web_base": "https://github.com",
+        "git_host": "github.com",
+        "env_token": "MEMHUB_GITHUB_TOKEN",
+        "token_url": "https://github.com/settings/tokens?type=beta",
+    },
+    "gitee": {
+        "display": "Gitee",
+        "api_base": "https://gitee.com/api/v5",
+        "web_base": "https://gitee.com",
+        "git_host": "gitee.com",
+        "env_token": "MEMHUB_GITEE_TOKEN",
+        "token_url": "https://gitee.com/profile/personal_access_tokens",
+    },
+}
+
+
+def config_path(repo: Path) -> Path:
+    return repo / ".memhub/config.yaml"
+
+
+def secrets_path(repo: Path) -> Path:
+    return repo / ".memhub/secrets.yaml"
+
+
+def load_config(repo: Path) -> dict[str, Any]:
+    return read_yaml(config_path(repo), {}) or {}
+
+
+def save_config(repo: Path, config: dict[str, Any]) -> None:
+    config.setdefault("schema_version", SCHEMA_VERSION)
+    write_yaml(config_path(repo), config)
+
+
+def load_secrets(repo: Path) -> dict[str, Any]:
+    return read_yaml(secrets_path(repo), {}) or {}
+
+
+def save_secrets(repo: Path, secrets: dict[str, Any]) -> None:
+    path = secrets_path(repo)
+    write_yaml(path, secrets)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def ensure_gitignore_secret(repo: Path) -> None:
+    path = repo / ".gitignore"
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    additions = [".memhub/secrets.yaml", ".memhub/secrets/"]
+    changed = False
+    for item in additions:
+        if item not in existing.splitlines():
+            existing = existing.rstrip() + ("\n" if existing.strip() else "") + item + "\n"
+            changed = True
+    if changed:
+        write_text(path, existing)
+
+
+def get_token(repo: Path, provider: str, explicit_token: str | None = None, require: bool = True) -> str | None:
+    meta = PROVIDERS[provider]
+    if explicit_token:
+        return explicit_token
+    if os.environ.get(meta["env_token"]):
+        return os.environ[meta["env_token"]]
+    secrets = load_secrets(repo)
+    token = ((secrets.get("sync") or {}).get(provider) or {}).get("token")
+    if token:
+        return token
+    if require:
+        raise SystemExit(
+            f"Missing {meta['display']} token. Pass --token, set {meta['env_token']}, "
+            f"or run `memhub --repo <path> sync setup {provider}`. Token page: {meta['token_url']}"
+        )
+    return None
+
+
+def store_token(repo: Path, provider: str, token: str, account: str | None = None) -> None:
+    ensure_gitignore_secret(repo)
+    secrets = load_secrets(repo)
+    sync = secrets.setdefault("sync", {})
+    item = sync.setdefault(provider, {})
+    item["token"] = token
+    if account:
+        item["account"] = account
+    item["updated_at"] = now_iso()
+    save_secrets(repo, secrets)
+
+
+def api_json(provider: str, method: str, path: str, token: str, payload: dict[str, Any] | None = None) -> tuple[int, dict[str, Any] | list[Any] | str]:
+    meta = PROVIDERS[provider]
+    url = meta["api_base"] + path
+    data: bytes | None = None
+    headers = {"Accept": "application/json", "User-Agent": "MemHub/0.1"}
+    if provider == "github":
+        headers["Authorization"] = f"Bearer {token}"
+        headers["X-GitHub-Api-Version"] = "2022-11-28"
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+    else:  # gitee uses access_token in JSON/body for broad compatibility
+        payload = dict(payload or {})
+        payload.setdefault("access_token", token)
+        if method.upper() == "GET":
+            sep = "&" if "?" in url else "?"
+            url = url + sep + urllib.parse.urlencode(payload)
+        else:
+            data = urllib.parse.urlencode(payload).encode("utf-8")
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(url, data=data, method=method.upper(), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+            if not raw:
+                return resp.status, {}
+            try:
+                return resp.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return resp.status, raw
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            body: dict[str, Any] | list[Any] | str = json.loads(raw)
+        except json.JSONDecodeError:
+            body = raw
+        return exc.code, body
+
+
+def provider_user(provider: str, token: str) -> str:
+    status, body = api_json(provider, "GET", "/user", token)
+    if status >= 400:
+        raise SystemExit(f"{PROVIDERS[provider]['display']} auth failed: HTTP {status}: {body}")
+    if not isinstance(body, dict):
+        raise SystemExit(f"Unexpected {PROVIDERS[provider]['display']} user response: {body}")
+    login = body.get("login") or body.get("username") or body.get("name")
+    if not login:
+        raise SystemExit(f"Cannot detect {PROVIDERS[provider]['display']} username from response: {body}")
+    return str(login)
+
+
+def repo_exists_or_create(provider: str, token: str, owner: str, repo_name: str, private: bool = True, create: bool = True) -> str:
+    meta = PROVIDERS[provider]
+    if not create:
+        return f"{meta['web_base']}/{owner}/{repo_name}"
+    if provider == "github":
+        payload = {"name": repo_name, "private": private, "auto_init": False}
+        status, body = api_json(provider, "POST", "/user/repos", token, payload)
+        if status in (200, 201):
+            return str((body if isinstance(body, dict) else {}).get("html_url") or f"{meta['web_base']}/{owner}/{repo_name}")
+        if status == 422:
+            return f"{meta['web_base']}/{owner}/{repo_name} (already exists or cannot create; continuing)"
+        raise SystemExit(f"Failed to create GitHub repo: HTTP {status}: {body}")
+    payload = {"name": repo_name, "private": "true" if private else "false", "auto_init": "false"}
+    status, body = api_json(provider, "POST", "/user/repos", token, payload)
+    if status in (200, 201):
+        if isinstance(body, dict):
+            return str(body.get("html_url") or body.get("human_name") or f"{meta['web_base']}/{owner}/{repo_name}")
+        return f"{meta['web_base']}/{owner}/{repo_name}"
+    if status in (400, 409, 422):
+        return f"{meta['web_base']}/{owner}/{repo_name} (already exists or cannot create; continuing)"
+    raise SystemExit(f"Failed to create Gitee repo: HTTP {status}: {body}")
+
+
+def remote_url(provider: str, owner: str, repo_name: str, method: str = "https") -> str:
+    host = PROVIDERS[provider]["git_host"]
+    if method == "ssh":
+        return f"git@{host}:{owner}/{repo_name}.git"
+    scheme_host = f"https://{host}"
+    return f"{scheme_host}/{owner}/{repo_name}.git"
+
+
+def auth_git_prefix(repo: Path) -> list[str]:
+    cfg = load_config(repo)
+    sync = cfg.get("sync") or {}
+    provider = sync.get("provider")
+    method = sync.get("auth_method", "token")
+    remote = sync.get("remote") or ""
+    if provider not in PROVIDERS or method != "token" or not str(remote).startswith("https://"):
+        return []
+    token = get_token(repo, provider, require=False)
+    if not token:
+        return []
+    account = sync.get("account") or ((load_secrets(repo).get("sync") or {}).get(provider) or {}).get("account") or "x-access-token"
+    if provider == "github":
+        raw = f"x-access-token:{token}".encode("utf-8")
+    else:
+        raw = f"{account}:{token}".encode("utf-8")
+    encoded = base64.b64encode(raw).decode("ascii")
+    return ["-c", f"http.extraHeader=Authorization: Basic {encoded}"]
+
+
+def run_git_auth(repo: Path, args: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
+    return run_git(repo, [*auth_git_prefix(repo), *args], check=check)
+
+
+def setup_git_sync(
+    repo: Path,
+    provider: str,
+    repo_name: str,
+    owner: str | None = None,
+    token: str | None = None,
+    branch: str = "main",
+    private: bool = True,
+    create_repo: bool = True,
+    auth_method: str = "token",
+    remote_method: str = "https",
+) -> str:
+    ensure_repo(repo)
+    if provider not in PROVIDERS:
+        raise SystemExit(f"Unsupported provider: {provider}. Choose: {', '.join(PROVIDERS)}")
+    if auth_method == "ssh" and remote_method != "ssh":
+        raise SystemExit("--auth ssh requires --remote-method ssh")
+    if auth_method == "token":
+        token = get_token(repo, provider, explicit_token=token, require=False)
+        if not token:
+            if sys.stdin.isatty():
+                token = getpass.getpass(f"{PROVIDERS[provider]['display']} token: ")
+            else:
+                raise SystemExit(f"Token required. Use --token or set {PROVIDERS[provider]['env_token']}.")
+        account = provider_user(provider, token)
+        owner = owner or account
+        store_token(repo, provider, token, account=account)
+    else:
+        token = None
+        account = owner or ""
+        if not owner:
+            raise SystemExit("--owner is required when --auth ssh is used")
+
+    owner = owner or account
+    web_url = repo_exists_or_create(provider, token, owner, repo_name, private=private, create=create_repo) if token else f"{PROVIDERS[provider]['web_base']}/{owner}/{repo_name}"
+    remote = remote_url(provider, owner, repo_name, method=remote_method)
+    run_git(repo, ["remote", "remove", "origin"], check=False)
+    run_git(repo, ["remote", "add", "origin", remote], check=False)
+    run_git(repo, ["branch", "-M", branch], check=False)
+
+    cfg = load_config(repo)
+    sync_cfg = cfg.setdefault("sync", {})
+    sync_cfg.update({
+        "backend": "git",
+        "type": "git",
+        "provider": provider,
+        "remote": remote,
+        "repo": f"{owner}/{repo_name}",
+        "branch": branch,
+        "auth_method": auth_method,
+        "remote_method": remote_method,
+        "auto_pull": True,
+        "auto_push": True,
+        "pull_strategy": "rebase",
+        "commit_prefix": "memhub:",
+        "updated_at": now_iso(),
+    })
+    if account:
+        sync_cfg["account"] = account
+    save_config(repo, cfg)
+    commit_all(repo, f"memhub: configure {provider} sync")
+    credential_line = "Token is stored locally in .memhub/secrets.yaml and ignored by git." if auth_method == "token" else "SSH auth selected; no token stored by MemHub."
+    return "\n".join([
+        f"Connected {PROVIDERS[provider]['display']} sync.",
+        f"Account: {account or owner}",
+        f"Repository: {owner}/{repo_name}",
+        f"Remote: {remote}",
+        f"Repo page: {web_url}",
+        credential_line,
+    ]) + "\n"
+
+
+def sync_status(repo: Path) -> str:
+    cfg = load_config(repo)
+    sync = cfg.get("sync") or {}
+    lines = ["MemHub sync status:"]
+    lines.append(f"- backend: {sync.get('backend') or sync.get('type') or 'git'}")
+    lines.append(f"- provider: {sync.get('provider') or 'custom'}")
+    lines.append(f"- repo: {sync.get('repo') or ''}")
+    lines.append(f"- branch: {sync.get('branch') or 'main'}")
+    lines.append(f"- remote: {sync.get('remote') or run_git(repo, ['remote', 'get-url', 'origin'], check=False).stdout.strip()}")
+    token_state = "not needed"
+    provider = sync.get("provider")
+    if provider in PROVIDERS and sync.get("auth_method") == "token":
+        token_state = "available" if get_token(repo, provider, require=False) else "missing"
+    lines.append(f"- credential: {token_state}")
+    lines.append(run_git(repo, ["status", "--short", "--branch"], check=False).stdout.strip())
+    return "\n".join(lines).strip() + "\n"
+
 def export_chatbot(repo: Path, project: str | None = None) -> Path:
     content = build_context(repo, project=project, pack="brief")
     out = repo / "exports/chatbot.md"
@@ -552,19 +849,28 @@ def commit_all(repo: Path, message: str) -> None:
 
 def sync_repo(repo: Path) -> str:
     ensure_repo(repo)
-    remote = run_git(repo, ["remote"], check=False).stdout.strip()
+    cfg = load_config(repo)
+    sync = cfg.get("sync") or {}
+    branch = sync.get("branch") or "main"
+    remote_names = run_git(repo, ["remote"], check=False).stdout.strip()
     outputs = []
-    if remote:
-        pull = run_git(repo, ["pull", "--rebase"], check=False)
+    if remote_names:
+        # Commit local changes, pull remote updates, then commit sync state and push everything.
+        commit_all(repo, "memhub: sync local changes")
+        pull = run_git_auth(repo, ["pull", "--rebase", "origin", branch], check=False)
         outputs.append(pull.stdout + pull.stderr)
-        push = run_git(repo, ["push"], check=False)
+        state = read_yaml(repo / ".memhub/state.yaml", {})
+        state["last_sync_at"] = now_iso()
+        write_yaml(repo / ".memhub/state.yaml", state)
+        commit_all(repo, "memhub: update sync state")
+        push = run_git_auth(repo, ["push", "-u", "origin", f"HEAD:{branch}"], check=False)
         outputs.append(push.stdout + push.stderr)
     else:
-        outputs.append("No git remote configured; local repository only.\n")
-    state = read_yaml(repo / ".memhub/state.yaml", {})
-    state["last_sync_at"] = now_iso()
-    write_yaml(repo / ".memhub/state.yaml", state)
-    commit_all(repo, "memhub: update sync state")
+        outputs.append("No git remote configured; local repository only. Run `memhub sync setup github` or `memhub sync setup gitee`.\n")
+        state = read_yaml(repo / ".memhub/state.yaml", {})
+        state["last_sync_at"] = now_iso()
+        write_yaml(repo / ".memhub/state.yaml", state)
+        commit_all(repo, "memhub: update sync state")
     return "".join(outputs)
 
 
@@ -604,7 +910,19 @@ def main(argv: list[str] | None = None) -> int:
     p_export.add_argument("target", choices=["chatbot"])
     p_export.add_argument("--project", default=None)
 
-    sub.add_parser("sync", help="Git pull/push")
+    p_sync = sub.add_parser("sync", help="Configure or run GitHub/Gitee sync")
+    sync_sub = p_sync.add_subparsers(dest="sync_cmd")
+    p_sync_setup = sync_sub.add_parser("setup", help="Set up hosted Git sync")
+    p_sync_setup.add_argument("provider", choices=["github", "gitee"])
+    p_sync_setup.add_argument("--repo-name", default="mymemhub", help="Remote repository name")
+    p_sync_setup.add_argument("--owner", default=None, help="Owner/login. Defaults to authenticated account")
+    p_sync_setup.add_argument("--token", default=None, help="Provider token. Prefer env vars MEMHUB_GITHUB_TOKEN/MEMHUB_GITEE_TOKEN")
+    p_sync_setup.add_argument("--branch", default="main")
+    p_sync_setup.add_argument("--public", action="store_true", help="Create public repo instead of private")
+    p_sync_setup.add_argument("--no-create", action="store_true", help="Do not call provider API to create repo")
+    p_sync_setup.add_argument("--auth", default="token", choices=["token", "ssh"], help="Git auth mode")
+    p_sync_setup.add_argument("--remote-method", default="https", choices=["https", "ssh"], help="Remote URL style")
+    sync_sub.add_parser("status", help="Show sync config/status")
 
     args = parser.parse_args(argv)
     repo = Path(args.repo).expanduser().resolve()
@@ -629,7 +947,23 @@ def main(argv: list[str] | None = None) -> int:
         out = export_chatbot(repo, project=args.project)
         print(f"Exported chatbot context: {out}")
     elif args.cmd == "sync":
-        print(sync_repo(repo), end="")
+        if getattr(args, "sync_cmd", None) == "setup":
+            print(setup_git_sync(
+                repo,
+                provider=args.provider,
+                repo_name=args.repo_name,
+                owner=args.owner,
+                token=args.token,
+                branch=args.branch,
+                private=not args.public,
+                create_repo=not args.no_create,
+                auth_method=args.auth,
+                remote_method=args.remote_method,
+            ), end="")
+        elif getattr(args, "sync_cmd", None) == "status":
+            print(sync_status(repo), end="")
+        else:
+            print(sync_repo(repo), end="")
     return 0
 
 

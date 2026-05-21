@@ -1,6 +1,15 @@
 ---
 name: hermes-memhub
+version: 0.1.0
 description: 使用 MemHub Protocol v0.1 读写用户的跨 Agent 统一记忆仓库。当用户要求记住信息、读取个人/项目上下文、生成 chatbot 注入文本、同步 Git 记忆仓库时使用。
+tags:
+  - memory
+  - memhub
+  - github
+  - gitee
+  - sync
+  - agent-memory
+license: MIT
 ---
 
 # Hermes MemHub Skill
@@ -78,22 +87,32 @@ python scripts/memhub.py --repo ~/memhub-data sync status
 python scripts/memhub.py --repo ~/memhub-data sync
 ```
 
-## Agent 行为约定
+## Agent 行为协议
 
-### 对话开始
+### 总原则
 
-如果当前任务需要用户长期偏好或项目上下文，应先执行：
+- `MEMHUB_REPO` 是用户记忆仓库；不要把用户记忆写入代码仓库。
+- GitHub/Gitee remote 只是同步后端；YAML/Markdown 文件仍是可信源数据。
+- 自动写入默认进入 `inbox`，不要直接写 canonical memory。
+- `sync setup` 会触发授权、创建仓库、修改 remote；**只有用户明确要求配置/切换同步时才执行**。
+- OAuth/token/SSH 凭据、authorization code、client secret、access token 都属于敏感信息；不要在回答中复述。
+
+### 对话开始：读取前同步
+
+如果当前任务需要用户长期偏好、项目上下文或跨设备最新记忆，执行：
 
 ```bash
 python scripts/memhub.py --repo "$MEMHUB_REPO" sync
-python scripts/memhub.py --repo "$MEMHUB_REPO" context
+python scripts/memhub.py --repo "$MEMHUB_REPO" context --pack brief
 ```
 
-将输出作为可审计上下文，而不是绝对事实。
+- 如果 `sync` 成功，再使用 `context` 输出。
+- 如果 `sync` 失败，不要丢弃本地数据；可以继续读取本地 `context`，但必须告知用户“远端同步失败，当前上下文可能不是最新”。
+- 将 context 作为可审计上下文，不要当成绝对事实；遇到冲突时优先询问用户。
 
-### 对话中
+### 对话中：写入 inbox
 
-当用户明确要求记忆时，直接写入 inbox：
+当用户明确要求记忆，或对话中形成稳定偏好/决策/事实时，写入 inbox：
 
 ```bash
 python scripts/memhub.py --repo "$MEMHUB_REPO" remember "内容" --type fact --source hermes
@@ -110,9 +129,52 @@ python scripts/memhub.py --repo "$MEMHUB_REPO" remember "内容" --type fact --s
 - `constraint`：约束
 - `convention`：惯例
 
-### 对话结束
+写入后，如果仓库配置了 remote，执行：
 
-如果对话中产生了重要决策、偏好或事实，可以写入 inbox，然后执行 sync。
+```bash
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync
+```
+
+### 同步 setup：只有用户明确要求时执行
+
+当用户说“配置同步”、“连接 GitHub/Gitee”、“换成 Gitee/GitHub 同步”时，才执行 setup。
+
+#### GitHub OAuth Device Flow
+
+```bash
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup github --repo-name mymemhub
+```
+
+- 需要 `MEMHUB_GITHUB_CLIENT_ID` 或 `--client-id`。
+- CLI 会输出授权 URL 和 user code；Agent 应把 URL/code 展示给用户，并等待用户完成授权。
+- 不要要求用户把 access token 发到聊天里。
+
+#### Gitee OAuth Authorization Code
+
+```bash
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup gitee --repo-name mymemhub
+```
+
+- 需要 `MEMHUB_GITEE_CLIENT_ID` 和 `MEMHUB_GITEE_CLIENT_SECRET`，或对应参数。
+- 默认监听 `127.0.0.1:8765/callback`。
+- 如果运行环境无法打开浏览器或接收本地回调，可使用 `--no-browser` 或 `--manual-code`。
+
+#### Token/SSH fallback
+
+仅当用户明确选择高级方式时使用：
+
+```bash
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup github --auth token --repo-name mymemhub
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup github --auth ssh --remote-method ssh --owner <login> --repo-name mymemhub --no-create
+```
+
+### 同步失败与冲突处理
+
+- 不要删除本地 `inbox`、canonical 文件或 `.git` 历史。
+- 将错误摘要告诉用户，避免泄露 token/header。
+- 如果 `git pull --rebase` 冲突，停止自动处理，报告冲突文件，让用户/Agent 单独修复。
+- 如果 provider 授权失败，建议用户重新授权或切换 token/SSH fallback。
+- 如果远端仓库创建失败但已存在，可以继续配置 remote 并尝试 sync。
 
 ### Canonical 归档
 
@@ -127,6 +189,7 @@ python scripts/memhub.py --repo "$MEMHUB_REPO" promote --dry-run
 
 ```bash
 python scripts/memhub.py --repo "$MEMHUB_REPO" promote --apply
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync
 ```
 
 当前最小归档规则：
@@ -144,6 +207,22 @@ python scripts/memhub.py --repo "$MEMHUB_REPO" promote --apply
 - 未确认猜测
 - 敏感信息，除非用户明确授权
 - 无新增信息的重复内容
+
+### 对话结束
+
+如果对话中产生重要决策、偏好或事实：
+
+1. 写入 inbox。
+2. 必要时 `promote --dry-run` 给出归档建议。
+3. 只有用户同意或规则非常明确时才 `promote --apply`。
+4. 执行 `sync`。
+
+## 发布与安全约束
+
+- 不要把真实 token、client secret、OAuth code 写进 `SKILL.md`、README、示例或提交历史。
+- `.memhub/secrets.yaml` 必须保持本地忽略。
+- 发布到 SkillHub/ClawHub 的包应包含：`SKILL.md`、`README.md`、`scripts/memhub.py`、`templates/context-pack.md.j2`。
+- 发布包不应包含 `__pycache__`、`.pyc`、`.git` 或用户个人记忆数据。
 
 ## 重要原则
 

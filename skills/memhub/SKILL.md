@@ -1,6 +1,6 @@
 ---
 name: memhub
-version: 0.1.0
+version: 0.1.1
 description: 使用 MemHub Protocol v0.1 读写用户的跨 Agent 统一记忆仓库。当用户要求记住信息、读取个人/项目上下文、生成 chatbot 注入文本、同步 Git 记忆仓库时使用。
 tags:
   - memory
@@ -9,7 +9,7 @@ tags:
   - gitee
   - sync
   - agent-memory
-license: MIT
+license: MIT-0
 ---
 
 # MemHub Skill

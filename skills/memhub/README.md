@@ -108,4 +108,4 @@ __pycache__/
 
 ## License
 
-MIT
+MIT-0

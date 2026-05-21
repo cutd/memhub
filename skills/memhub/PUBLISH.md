@@ -1,13 +1,13 @@
-# 发布说明：Hermes MemHub Skill
+# 发布说明：MemHub Skill
 
 ## 建议发布信息
 
-- Slug: `hermes-memhub`
-- Display name: `Hermes MemHub`
+- Slug: `memhub`
+- Display name: `MemHub`
 - Version: `0.1.0`
 - Tags: `memory`, `memhub`, `github`, `gitee`, `sync`, `agent-memory`
 - Summary: `跨 Agent 统一记忆仓库 Skill：支持 inbox 写入、canonical 归档、上下文导出，以及 GitHub/Gitee OAuth 同步。`
-- Changelog: `完善 Agent 同步行为协议；支持 GitHub/Gitee OAuth、token/SSH fallback；补充同步失败、OAuth 交互、promote 后同步等规则。`
+- Changelog: `将 Skill 名称泛化为 MemHub；完善 Agent 同步行为协议；支持 GitHub/Gitee OAuth、token/SSH fallback；补充同步失败、OAuth 交互、promote 后同步等规则。`
 
 ## 包内容
 
@@ -56,16 +56,14 @@ ClawHub 支持网页上传，也提供 OpenAPI：`https://clawhub.ai/api/v1/open
 5. 填写 Slug、名称、版本、简介、变更说明和标签。
 6. 提交。
 
-API 方式需要 Bearer API token：
+API 方式需要 Bearer API token。请在安全环境里设置环境变量，不要把 token 写进仓库或聊天记录：
 
 ```bash
 curl -X POST https://clawhub.ai/api/v1/skills \
   -H "Authorization: Bearer $CLAWHUB_TOKEN" \
-  -F 'payload={"slug":"hermes-memhub","displayName":"Hermes MemHub","version":"0.1.0","changelog":"完善 Agent 同步行为协议；支持 GitHub/Gitee OAuth、token/SSH fallback。","tags":["memory","memhub","github","gitee","sync","agent-memory"]}' \
+  -F 'payload={"slug":"memhub","displayName":"MemHub","version":"0.1.0","changelog":"将 Skill 名称泛化为 MemHub；完善 Agent 同步行为协议；支持 GitHub/Gitee OAuth、token/SSH fallback。","tags":["memory","memhub","github","gitee","sync","agent-memory"]}' \
   -F 'files=@SKILL.md;filename=SKILL.md' \
   -F 'files=@README.md;filename=README.md' \
   -F 'files=@scripts/memhub.py;filename=scripts/memhub.py' \
   -F 'files=@templates/context-pack.md.j2;filename=templates/context-pack.md.j2'
 ```
-
-不要把 `$CLAWHUB_TOKEN` 写进仓库或聊天记录。

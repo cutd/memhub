@@ -8,7 +8,7 @@ It lets AI agents read and write a shared, human-auditable memory repository usi
 
 - `protocol/` — MemHub Protocol v0.1 draft
 - `memhub_cli/` — minimal Python CLI/reference implementation
-- `skills/hermes-memhub/` — Hermes Skill MVP
+- `skills/memhub/` — generic MemHub Skill for OpenClaw, Hermes, and other agents
 - `examples/memhub-data/` — sample MemHub Repository
 
 ## MVP Commands

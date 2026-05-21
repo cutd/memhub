@@ -1,5 +1,5 @@
 ---
-name: hermes-memhub
+name: memhub
 version: 0.1.0
 description: 使用 MemHub Protocol v0.1 读写用户的跨 Agent 统一记忆仓库。当用户要求记住信息、读取个人/项目上下文、生成 chatbot 注入文本、同步 Git 记忆仓库时使用。
 tags:
@@ -12,9 +12,9 @@ tags:
 license: MIT
 ---
 
-# Hermes MemHub Skill
+# MemHub Skill
 
-MemHub 是一个无服务端、Git-first 的个人 AI 记忆协议。本 Skill 让 Hermes 能够读取、写入和同步符合 MemHub Protocol v0.1 的记忆仓库。
+MemHub 是一个无服务端、Git-first 的个人 AI 记忆协议。本 Skill 让 Agent 能够读取、写入和同步符合 MemHub Protocol v0.1 的记忆仓库。
 
 ## 触发场景
 
@@ -62,8 +62,8 @@ python scripts/memhub.py --repo ~/memhub-data context
 python scripts/memhub.py --repo ~/memhub-data context --pack brief
 
 # 写入 inbox
-python scripts/memhub.py --repo ~/memhub-data remember "用户偏好结构化直接的回答" --type preference --source hermes
-python scripts/memhub.py --repo ~/memhub-data remember "MemHub 采用 Git-first 架构" --type decision --project memhub --source hermes
+python scripts/memhub.py --repo ~/memhub-data remember "用户偏好结构化直接的回答" --type preference --source agent
+python scripts/memhub.py --repo ~/memhub-data remember "MemHub 采用 Git-first 架构" --type decision --project memhub --source agent
 
 # 检查 inbox
 python scripts/memhub.py --repo ~/memhub-data inbox list
@@ -115,7 +115,7 @@ python scripts/memhub.py --repo "$MEMHUB_REPO" context --pack brief
 当用户明确要求记忆，或对话中形成稳定偏好/决策/事实时，写入 inbox：
 
 ```bash
-python scripts/memhub.py --repo "$MEMHUB_REPO" remember "内容" --type fact --source hermes
+python scripts/memhub.py --repo "$MEMHUB_REPO" remember "内容" --type fact --source agent
 ```
 
 类型建议：

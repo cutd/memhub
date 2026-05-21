@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Hermes MemHub Skill wrapper.
+"""MemHub Skill wrapper.
 
-Standalone copy of memhub_cli.__main__ for Hermes/OpenClaw skill installs.
+Standalone copy of memhub_cli.__main__ for OpenClaw/skill installs.
 """
 
 from __future__ import annotations

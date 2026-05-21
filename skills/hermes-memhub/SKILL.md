@@ -28,6 +28,12 @@ export MEMHUB_REPO=/path/to/memhub-data
 同步 setup 可选使用：
 
 ```bash
+# OAuth app 配置
+export MEMHUB_GITHUB_CLIENT_ID=...
+export MEMHUB_GITEE_CLIENT_ID=...
+export MEMHUB_GITEE_CLIENT_SECRET=...
+
+# Token fallback
 export MEMHUB_GITHUB_TOKEN=...
 export MEMHUB_GITEE_TOKEN=...
 ```
@@ -63,9 +69,10 @@ python scripts/memhub.py --repo ~/memhub-data promote <filename-or-id-fragment> 
 # 导出给 chatbot 的上下文
 python scripts/memhub.py --repo ~/memhub-data export chatbot
 
-# 同步 GitHub/Gitee
+# 同步 GitHub/Gitee（默认 OAuth；发布版应内置 GitHub/Gitee OAuth app 配置）
 python scripts/memhub.py --repo ~/memhub-data sync setup github --repo-name mymemhub
 python scripts/memhub.py --repo ~/memhub-data sync setup gitee --repo-name mymemhub
+python scripts/memhub.py --repo ~/memhub-data sync setup github --auth token --repo-name mymemhub
 python scripts/memhub.py --repo ~/memhub-data sync setup github --auth ssh --remote-method ssh --owner <login> --repo-name mymemhub --no-create
 python scripts/memhub.py --repo ~/memhub-data sync status
 python scripts/memhub.py --repo ~/memhub-data sync

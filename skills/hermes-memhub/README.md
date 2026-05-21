@@ -12,20 +12,26 @@ export MEMHUB_REPO=~/memhub-data
 
 ## 配置 GitHub/Gitee 同步
 
-推荐使用产品化 setup 命令，而不是手动配置 remote：
+推荐使用 OAuth setup 命令，而不是手动配置 remote：
 
 ```bash
-# GitHub：适合海外用户/开发者
+# GitHub：Device Flow。发布版应内置 client id；开发版可用环境变量或参数传入
+export MEMHUB_GITHUB_CLIENT_ID=<github-oauth-app-client-id>
 python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup github --repo-name mymemhub
 
-# Gitee：适合中国大陆用户
+# Gitee：Authorization Code + 本地回调
+export MEMHUB_GITEE_CLIENT_ID=<gitee-oauth-app-client-id>
+export MEMHUB_GITEE_CLIENT_SECRET=<gitee-oauth-app-client-secret>
 python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup gitee --repo-name mymemhub
+
+# Token fallback
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup github --auth token --repo-name mymemhub
 
 # 如果已经配置好 SSH key，也可以使用 SSH remote
 python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup github --auth ssh --remote-method ssh --owner <login> --repo-name mymemhub --no-create
 ```
 
-Token 可以通过 `--token`、`MEMHUB_GITHUB_TOKEN`、`MEMHUB_GITEE_TOKEN` 或交互输入提供。Token 会保存在本地 `.memhub/secrets.yaml`，并被 `.gitignore` 忽略。
+OAuth / token 会保存在本地 `.memhub/secrets.yaml`，并被 `.gitignore` 忽略。不要把 OAuth app 的 client secret 提交到仓库；Gitee 开发版可通过环境变量传入。
 
 ## 首次初始化
 

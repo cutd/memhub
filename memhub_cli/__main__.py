@@ -10,6 +10,10 @@ import random
 import string
 import subprocess
 import sys
+import threading
+import time
+import webbrowser
+import http.server
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -543,6 +547,9 @@ PROVIDERS: dict[str, dict[str, str]] = {
         "git_host": "github.com",
         "env_token": "MEMHUB_GITHUB_TOKEN",
         "token_url": "https://github.com/settings/tokens?type=beta",
+        "oauth_device_code_url": "https://github.com/login/device/code",
+        "oauth_access_token_url": "https://github.com/login/oauth/access_token",
+        "env_client_id": "MEMHUB_GITHUB_CLIENT_ID",
     },
     "gitee": {
         "display": "Gitee",
@@ -551,6 +558,10 @@ PROVIDERS: dict[str, dict[str, str]] = {
         "git_host": "gitee.com",
         "env_token": "MEMHUB_GITEE_TOKEN",
         "token_url": "https://gitee.com/profile/personal_access_tokens",
+        "oauth_authorize_url": "https://gitee.com/oauth/authorize",
+        "oauth_access_token_url": "https://gitee.com/oauth/token",
+        "env_client_id": "MEMHUB_GITEE_CLIENT_ID",
+        "env_client_secret": "MEMHUB_GITEE_CLIENT_SECRET",
     },
 }
 
@@ -716,7 +727,7 @@ def auth_git_prefix(repo: Path) -> list[str]:
     provider = sync.get("provider")
     method = sync.get("auth_method", "token")
     remote = sync.get("remote") or ""
-    if provider not in PROVIDERS or method != "token" or not str(remote).startswith("https://"):
+    if provider not in PROVIDERS or method not in {"token", "oauth"} or not str(remote).startswith("https://"):
         return []
     token = get_token(repo, provider, require=False)
     if not token:
@@ -734,6 +745,179 @@ def run_git_auth(repo: Path, args: list[str], check: bool = False) -> subprocess
     return run_git(repo, [*auth_git_prefix(repo), *args], check=check)
 
 
+
+def form_post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any] | str]:
+    data = urllib.parse.urlencode(payload).encode("utf-8")
+    req_headers = {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "MemHub/0.1"}
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, data=data, method="POST", headers=req_headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+            if not raw:
+                return resp.status, {}
+            try:
+                return resp.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return resp.status, raw
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            return exc.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return exc.code, raw
+
+
+def open_or_print_url(url: str, no_browser: bool = False) -> None:
+    print(f"Open this URL in your browser:\n{url}\n", file=sys.stderr)
+    if not no_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+
+def github_device_flow(client_id: str, scope: str = "repo", no_browser: bool = False) -> str:
+    meta = PROVIDERS["github"]
+    status, body = form_post_json(meta["oauth_device_code_url"], {"client_id": client_id, "scope": scope})
+    if status >= 400 or not isinstance(body, dict):
+        raise SystemExit(f"GitHub device flow failed: HTTP {status}: {body}")
+    device_code = body.get("device_code")
+    user_code = body.get("user_code")
+    verification_uri = body.get("verification_uri") or body.get("verification_uri_complete")
+    interval = int(body.get("interval") or 5)
+    if not device_code or not user_code or not verification_uri:
+        raise SystemExit(f"Invalid GitHub device response: {body}")
+    print("GitHub authorization required.", file=sys.stderr)
+    print(f"User code: {user_code}", file=sys.stderr)
+    open_or_print_url(str(verification_uri), no_browser=no_browser)
+    while True:
+        time.sleep(interval)
+        status, token_body = form_post_json(
+            meta["oauth_access_token_url"],
+            {
+                "client_id": client_id,
+                "device_code": device_code,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            },
+        )
+        if status >= 400 or not isinstance(token_body, dict):
+            raise SystemExit(f"GitHub token exchange failed: HTTP {status}: {token_body}")
+        if token_body.get("access_token"):
+            return str(token_body["access_token"])
+        error = token_body.get("error")
+        if error == "authorization_pending":
+            continue
+        if error == "slow_down":
+            interval += 5
+            continue
+        raise SystemExit(f"GitHub authorization failed: {token_body}")
+
+
+class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "MemHubOAuth/0.1"
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        self.server.oauth_code = (params.get("code") or [None])[0]  # type: ignore[attr-defined]
+        self.server.oauth_error = (params.get("error") or [None])[0]  # type: ignore[attr-defined]
+        if self.server.oauth_code:  # type: ignore[attr-defined]
+            body = "MemHub authorization complete. You can close this tab."
+        else:
+            body = "MemHub authorization failed. You can close this tab."
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body.encode("utf-8"))))
+        self.end_headers()
+        self.wfile.write(body.encode("utf-8"))
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+
+def wait_for_local_oauth_code(port: int, timeout: int = 180) -> tuple[str | None, str]:
+    server = http.server.HTTPServer(("127.0.0.1", port), OAuthCallbackHandler)
+    server.oauth_code = None  # type: ignore[attr-defined]
+    server.oauth_error = None  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.handle_request, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+    code = getattr(server, "oauth_code", None)
+    error = getattr(server, "oauth_error", None)
+    server.server_close()
+    return code, error or ""
+
+
+def gitee_oauth_flow(client_id: str, client_secret: str, redirect_uri: str, scope: str = "user_info projects", no_browser: bool = False, callback_port: int = 8765, manual_code: str | None = None) -> str:
+    meta = PROVIDERS["gitee"]
+    if not redirect_uri:
+        redirect_uri = f"http://127.0.0.1:{callback_port}/callback"
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": scope,
+    }
+    authorize_url = meta["oauth_authorize_url"] + "?" + urllib.parse.urlencode(params)
+    code = manual_code
+    if not code:
+        open_or_print_url(authorize_url, no_browser=no_browser)
+        if redirect_uri.startswith("http://127.0.0.1") or redirect_uri.startswith("http://localhost"):
+            print(f"Waiting for OAuth callback on {redirect_uri} ...", file=sys.stderr)
+            code, err = wait_for_local_oauth_code(callback_port)
+            if err:
+                raise SystemExit(f"Gitee authorization failed: {err}")
+        if not code:
+            if sys.stdin.isatty():
+                code = input("Paste Gitee authorization code: ").strip()
+            else:
+                raise SystemExit("No Gitee authorization code received. Re-run with --manual-code or use an interactive terminal.")
+    status, body = form_post_json(
+        meta["oauth_access_token_url"],
+        {
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "client_secret": client_secret,
+        },
+    )
+    if status >= 400 or not isinstance(body, dict) or not body.get("access_token"):
+        raise SystemExit(f"Gitee token exchange failed: HTTP {status}: {body}")
+    return str(body["access_token"])
+
+
+def oauth_token(
+    provider: str,
+    client_id: str | None = None,
+    client_secret: str | None = None,
+    scope: str | None = None,
+    redirect_uri: str | None = None,
+    callback_port: int = 8765,
+    no_browser: bool = False,
+    manual_code: str | None = None,
+) -> str:
+    meta = PROVIDERS[provider]
+    client_id = client_id or os.environ.get(meta.get("env_client_id", ""))
+    if not client_id:
+        raise SystemExit(f"Missing {meta['display']} OAuth client id. Pass --client-id or set {meta.get('env_client_id', '')}.")
+    if provider == "github":
+        return github_device_flow(client_id, scope=scope or "repo", no_browser=no_browser)
+    client_secret = client_secret or os.environ.get(meta.get("env_client_secret", ""))
+    if not client_secret:
+        raise SystemExit(f"Missing Gitee OAuth client secret. Pass --client-secret or set {meta.get('env_client_secret', '')}.")
+    return gitee_oauth_flow(
+        client_id,
+        client_secret,
+        redirect_uri=redirect_uri or f"http://127.0.0.1:{callback_port}/callback",
+        scope=scope or "user_info projects",
+        no_browser=no_browser,
+        callback_port=callback_port,
+        manual_code=manual_code,
+    )
+
 def setup_git_sync(
     repo: Path,
     provider: str,
@@ -745,19 +929,40 @@ def setup_git_sync(
     create_repo: bool = True,
     auth_method: str = "token",
     remote_method: str = "https",
+    client_id: str | None = None,
+    client_secret: str | None = None,
+    scope: str | None = None,
+    redirect_uri: str | None = None,
+    callback_port: int = 8765,
+    no_browser: bool = False,
+    manual_code: str | None = None,
 ) -> str:
     ensure_repo(repo)
     if provider not in PROVIDERS:
         raise SystemExit(f"Unsupported provider: {provider}. Choose: {', '.join(PROVIDERS)}")
     if auth_method == "ssh" and remote_method != "ssh":
         raise SystemExit("--auth ssh requires --remote-method ssh")
-    if auth_method == "token":
-        token = get_token(repo, provider, explicit_token=token, require=False)
-        if not token:
-            if sys.stdin.isatty():
-                token = getpass.getpass(f"{PROVIDERS[provider]['display']} token: ")
-            else:
-                raise SystemExit(f"Token required. Use --token or set {PROVIDERS[provider]['env_token']}.")
+    if auth_method in {"token", "oauth"} and remote_method != "https":
+        raise SystemExit("--auth token/oauth requires --remote-method https")
+    if auth_method in {"token", "oauth"}:
+        if auth_method == "oauth":
+            token = oauth_token(
+                provider,
+                client_id=client_id,
+                client_secret=client_secret,
+                scope=scope,
+                redirect_uri=redirect_uri,
+                callback_port=callback_port,
+                no_browser=no_browser,
+                manual_code=manual_code,
+            )
+        else:
+            token = get_token(repo, provider, explicit_token=token, require=False)
+            if not token:
+                if sys.stdin.isatty():
+                    token = getpass.getpass(f"{PROVIDERS[provider]['display']} token: ")
+                else:
+                    raise SystemExit(f"Token required. Use --token or set {PROVIDERS[provider]['env_token']}.")
         account = provider_user(provider, token)
         owner = owner or account
         store_token(repo, provider, token, account=account)
@@ -795,7 +1000,12 @@ def setup_git_sync(
         sync_cfg["account"] = account
     save_config(repo, cfg)
     commit_all(repo, f"memhub: configure {provider} sync")
-    credential_line = "Token is stored locally in .memhub/secrets.yaml and ignored by git." if auth_method == "token" else "SSH auth selected; no token stored by MemHub."
+    if auth_method == "oauth":
+        credential_line = "OAuth token is stored locally in .memhub/secrets.yaml and ignored by git."
+    elif auth_method == "token":
+        credential_line = "Token is stored locally in .memhub/secrets.yaml and ignored by git."
+    else:
+        credential_line = "SSH auth selected; no token stored by MemHub."
     return "\n".join([
         f"Connected {PROVIDERS[provider]['display']} sync.",
         f"Account: {account or owner}",
@@ -817,7 +1027,7 @@ def sync_status(repo: Path) -> str:
     lines.append(f"- remote: {sync.get('remote') or run_git(repo, ['remote', 'get-url', 'origin'], check=False).stdout.strip()}")
     token_state = "not needed"
     provider = sync.get("provider")
-    if provider in PROVIDERS and sync.get("auth_method") == "token":
+    if provider in PROVIDERS and sync.get("auth_method") in {"token", "oauth"}:
         token_state = "available" if get_token(repo, provider, require=False) else "missing"
     lines.append(f"- credential: {token_state}")
     lines.append(run_git(repo, ["status", "--short", "--branch"], check=False).stdout.strip())
@@ -914,8 +1124,15 @@ def main(argv: list[str] | None = None) -> int:
     p_sync_setup.add_argument("--branch", default="main")
     p_sync_setup.add_argument("--public", action="store_true", help="Create public repo instead of private")
     p_sync_setup.add_argument("--no-create", action="store_true", help="Do not call provider API to create repo")
-    p_sync_setup.add_argument("--auth", default="token", choices=["token", "ssh"], help="Git auth mode")
+    p_sync_setup.add_argument("--auth", default="oauth", choices=["oauth", "token", "ssh"], help="Git auth mode. OAuth uses GitHub Device Flow or Gitee authorization-code flow")
     p_sync_setup.add_argument("--remote-method", default="https", choices=["https", "ssh"], help="Remote URL style")
+    p_sync_setup.add_argument("--client-id", default=None, help="OAuth client id. Or set MEMHUB_GITHUB_CLIENT_ID / MEMHUB_GITEE_CLIENT_ID")
+    p_sync_setup.add_argument("--client-secret", default=None, help="Gitee OAuth client secret. Or set MEMHUB_GITEE_CLIENT_SECRET")
+    p_sync_setup.add_argument("--scope", default=None, help="OAuth scope. Defaults: GitHub repo; Gitee user_info projects")
+    p_sync_setup.add_argument("--redirect-uri", default=None, help="Gitee OAuth redirect URI. Defaults to local callback")
+    p_sync_setup.add_argument("--callback-port", type=int, default=8765, help="Local callback port for Gitee OAuth")
+    p_sync_setup.add_argument("--no-browser", action="store_true", help="Print OAuth URL/code but do not try to open browser")
+    p_sync_setup.add_argument("--manual-code", default=None, help="Gitee OAuth authorization code for manual callback flow")
     sync_sub.add_parser("status", help="Show sync config/status")
 
     args = parser.parse_args(argv)
@@ -953,6 +1170,13 @@ def main(argv: list[str] | None = None) -> int:
                 create_repo=not args.no_create,
                 auth_method=args.auth,
                 remote_method=args.remote_method,
+                client_id=args.client_id,
+                client_secret=args.client_secret,
+                scope=args.scope,
+                redirect_uri=args.redirect_uri,
+                callback_port=args.callback_port,
+                no_browser=args.no_browser,
+                manual_code=args.manual_code,
             ), end="")
         elif getattr(args, "sync_cmd", None) == "status":
             print(sync_status(repo), end="")

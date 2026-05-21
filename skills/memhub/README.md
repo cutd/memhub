@@ -48,9 +48,23 @@ export MEMHUB_GITHUB_CLIENT_ID=<github-oauth-app-client-id>
 python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup github --repo-name mymemhub
 ```
 
-### Gitee Authorization Code
+### Gitee 一键授权 / Authorization Code
 
-MemHub 可内置 Gitee OAuth App client id；但 Gitee Authorization Code Flow 仍需要 client secret。公开 Skill 包不会内置 secret，普通用户免配置 Gitee 需要后续 MemHub Cloud/OAuth broker。
+Gitee 要做到普通用户“只点确认授权”，不能把 `client_secret` 写进 Skill。正确路径是 MemHub OAuth Broker：
+
+1. CLI 打开 MemHub Broker 的 Gitee 授权页；
+2. 用户在 Gitee 页面点击确认授权；
+3. Broker 在服务端使用 Gitee `client_secret` 换取 token；
+4. CLI 只接收最终 token 并存入本地 `.memhub/secrets.yaml`。
+
+客户端使用方式：
+
+```bash
+export MEMHUB_GITEE_OAUTH_BROKER_URL=https://<your-broker-host>
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup gitee --repo-name mymemhub
+```
+
+开发者直连模式仍可使用 `client_secret`，但不要把 secret 提交到仓库或发布包：
 
 ```bash
 export MEMHUB_GITEE_CLIENT_SECRET=<gitee-oauth-app-client-secret>

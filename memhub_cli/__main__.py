@@ -604,6 +604,7 @@ PROVIDERS: dict[str, dict[str, str]] = {
         "env_client_id": "MEMHUB_GITEE_CLIENT_ID",
         "default_client_id": '857230fab7f3c4cf4439383f1afc236f4f3ec2435fb114e149c0cfc288e589f8',
         "env_client_secret": "MEMHUB_GITEE_CLIENT_SECRET",
+        "env_broker_url": "MEMHUB_GITEE_OAUTH_BROKER_URL",
     },
 }
 
@@ -811,6 +812,29 @@ def form_post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | 
             return exc.code, raw
 
 
+def json_post(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any] | str]:
+    data = json.dumps(payload).encode("utf-8")
+    req_headers = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": "MemHub/0.1"}
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, data=data, method="POST", headers=req_headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+            if not raw:
+                return resp.status, {}
+            try:
+                return resp.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return resp.status, raw
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            return exc.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return exc.code, raw
+
+
 def open_or_print_url(url: str, no_browser: bool = False) -> None:
     print(f"Open this URL in your browser:\n{url}\n", file=sys.stderr)
     if not no_browser:
@@ -864,6 +888,7 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
         self.server.oauth_code = (params.get("code") or [None])[0]  # type: ignore[attr-defined]
+        self.server.oauth_state = (params.get("state") or [None])[0]  # type: ignore[attr-defined]
         self.server.oauth_error = (params.get("error") or [None])[0]  # type: ignore[attr-defined]
         if self.server.oauth_code:  # type: ignore[attr-defined]
             body = "MemHub authorization complete. You can close this tab."
@@ -879,17 +904,19 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
         return
 
 
-def wait_for_local_oauth_code(port: int, timeout: int = 180) -> tuple[str | None, str]:
+def wait_for_local_oauth_code(port: int, timeout: int = 180) -> tuple[str | None, str, str | None]:
     server = http.server.HTTPServer(("127.0.0.1", port), OAuthCallbackHandler)
     server.oauth_code = None  # type: ignore[attr-defined]
+    server.oauth_state = None  # type: ignore[attr-defined]
     server.oauth_error = None  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.handle_request, daemon=True)
     thread.start()
     thread.join(timeout=timeout)
     code = getattr(server, "oauth_code", None)
+    state = getattr(server, "oauth_state", None)
     error = getattr(server, "oauth_error", None)
     server.server_close()
-    return code, error or ""
+    return code, error or "", state
 
 
 def gitee_oauth_flow(client_id: str, client_secret: str, redirect_uri: str, scope: str = "user_info projects", no_browser: bool = False, callback_port: int = 8765, manual_code: str | None = None) -> str:
@@ -908,7 +935,7 @@ def gitee_oauth_flow(client_id: str, client_secret: str, redirect_uri: str, scop
         open_or_print_url(authorize_url, no_browser=no_browser)
         if redirect_uri.startswith("http://127.0.0.1") or redirect_uri.startswith("http://localhost"):
             print(f"Waiting for OAuth callback on {redirect_uri} ...", file=sys.stderr)
-            code, err = wait_for_local_oauth_code(callback_port)
+            code, err, _state = wait_for_local_oauth_code(callback_port)
             if err:
                 raise SystemExit(f"Gitee authorization failed: {err}")
         if not code:
@@ -931,6 +958,46 @@ def gitee_oauth_flow(client_id: str, client_secret: str, redirect_uri: str, scop
     return str(body["access_token"])
 
 
+def gitee_broker_oauth_flow(broker_url: str, redirect_uri: str, scope: str = "user_info projects", no_browser: bool = False, callback_port: int = 8765, manual_code: str | None = None) -> str:
+    """Gitee OAuth via MemHub OAuth Broker.
+
+    Broker protocol:
+    - GET  {broker}/oauth/gitee/authorize?redirect_uri=...&scope=...&state=...
+      redirects user to Gitee, then back to the local redirect_uri with a short `code`.
+    - POST {broker}/oauth/gitee/token {code, redirect_uri, state}
+      returns {access_token}. The Gitee client_secret stays on the broker server.
+    """
+    broker = broker_url.rstrip("/")
+    if not redirect_uri:
+        redirect_uri = f"http://127.0.0.1:{callback_port}/callback"
+    state = short_id(24)
+    authorize_url = broker + "/oauth/gitee/authorize?" + urllib.parse.urlencode({
+        "redirect_uri": redirect_uri,
+        "scope": scope,
+        "state": state,
+    })
+    code = manual_code
+    returned_state = None
+    if not code:
+        open_or_print_url(authorize_url, no_browser=no_browser)
+        if redirect_uri.startswith("http://127.0.0.1") or redirect_uri.startswith("http://localhost"):
+            print(f"Waiting for Gitee OAuth broker callback on {redirect_uri} ...", file=sys.stderr)
+            code, err, returned_state = wait_for_local_oauth_code(callback_port)
+            if err:
+                raise SystemExit(f"Gitee authorization failed: {err}")
+        if not code:
+            if sys.stdin.isatty():
+                code = input("Paste MemHub/Gitee broker authorization code: ").strip()
+            else:
+                raise SystemExit("No Gitee authorization code received. Re-run with --manual-code or use an interactive terminal.")
+    if returned_state and returned_state != state:
+        raise SystemExit("Gitee authorization failed: OAuth state mismatch.")
+    status, body = json_post(broker + "/oauth/gitee/token", {"code": code, "redirect_uri": redirect_uri, "state": state})
+    if status >= 400 or not isinstance(body, dict) or not body.get("access_token"):
+        raise SystemExit(f"Gitee broker token exchange failed: HTTP {status}: {body}")
+    return str(body["access_token"])
+
+
 def oauth_token(
     provider: str,
     client_id: str | None = None,
@@ -940,6 +1007,7 @@ def oauth_token(
     callback_port: int = 8765,
     no_browser: bool = False,
     manual_code: str | None = None,
+    broker_url: str | None = None,
 ) -> str:
     meta = PROVIDERS[provider]
     client_id = client_id or os.environ.get(meta.get("env_client_id", "")) or meta.get("default_client_id")
@@ -947,9 +1015,23 @@ def oauth_token(
         raise SystemExit(f"Missing {meta['display']} OAuth client id. Pass --client-id or set {meta.get('env_client_id', '')}.")
     if provider == "github":
         return github_device_flow(client_id, scope=scope or "repo", no_browser=no_browser)
+    broker_url = broker_url or os.environ.get(meta.get("env_broker_url", ""))
     client_secret = client_secret or os.environ.get(meta.get("env_client_secret", ""))
+    if provider == "gitee" and broker_url and not client_secret:
+        return gitee_broker_oauth_flow(
+            broker_url,
+            redirect_uri=redirect_uri or f"http://127.0.0.1:{callback_port}/callback",
+            scope=scope or "user_info projects",
+            no_browser=no_browser,
+            callback_port=callback_port,
+            manual_code=manual_code,
+        )
     if not client_secret:
-        raise SystemExit(f"Missing Gitee OAuth client secret. Pass --client-secret or set {meta.get('env_client_secret', '')}.")
+        raise SystemExit(
+            "Gitee one-click OAuth requires a MemHub OAuth Broker. Set MEMHUB_GITEE_OAUTH_BROKER_URL, "
+            "or use developer direct mode with --client-secret / MEMHUB_GITEE_CLIENT_SECRET. "
+            "Do not embed Gitee client_secret in public code."
+        )
     return gitee_oauth_flow(
         client_id,
         client_secret,
@@ -978,6 +1060,7 @@ def setup_git_sync(
     callback_port: int = 8765,
     no_browser: bool = False,
     manual_code: str | None = None,
+    broker_url: str | None = None,
 ) -> str:
     ensure_repo(repo)
     if provider not in PROVIDERS:
@@ -997,6 +1080,7 @@ def setup_git_sync(
                 callback_port=callback_port,
                 no_browser=no_browser,
                 manual_code=manual_code,
+                broker_url=broker_url,
             )
         else:
             token = get_token(repo, provider, explicit_token=token, require=False)
@@ -1176,6 +1260,7 @@ def main(argv: list[str] | None = None) -> int:
     p_sync_setup.add_argument("--callback-port", type=int, default=8765, help="Local callback port for Gitee OAuth")
     p_sync_setup.add_argument("--no-browser", action="store_true", help="Print OAuth URL/code but do not try to open browser")
     p_sync_setup.add_argument("--manual-code", default=None, help="Gitee OAuth authorization code for manual callback flow")
+    p_sync_setup.add_argument("--broker-url", default=None, help="MemHub OAuth Broker base URL for Gitee one-click OAuth. Or set MEMHUB_GITEE_OAUTH_BROKER_URL")
     sync_sub.add_parser("status", help="Show sync config/status")
 
     args = parser.parse_args(argv)
@@ -1220,6 +1305,7 @@ def main(argv: list[str] | None = None) -> int:
                 callback_port=args.callback_port,
                 no_browser=args.no_browser,
                 manual_code=args.manual_code,
+                broker_url=args.broker_url,
             ), end="")
         elif getattr(args, "sync_cmd", None) == "status":
             print(sync_status(repo), end="")

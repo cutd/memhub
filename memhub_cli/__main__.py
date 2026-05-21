@@ -590,6 +590,7 @@ PROVIDERS: dict[str, dict[str, str]] = {
         "oauth_device_code_url": "https://github.com/login/device/code",
         "oauth_access_token_url": "https://github.com/login/oauth/access_token",
         "env_client_id": "MEMHUB_GITHUB_CLIENT_ID",
+        "default_client_id": 'Ov23livelceFZGWGJG0A',
     },
     "gitee": {
         "display": "Gitee",
@@ -601,6 +602,7 @@ PROVIDERS: dict[str, dict[str, str]] = {
         "oauth_authorize_url": "https://gitee.com/oauth/authorize",
         "oauth_access_token_url": "https://gitee.com/oauth/token",
         "env_client_id": "MEMHUB_GITEE_CLIENT_ID",
+        "default_client_id": '857230fab7f3c4cf4439383f1afc236f4f3ec2435fb114e149c0cfc288e589f8',
         "env_client_secret": "MEMHUB_GITEE_CLIENT_SECRET",
     },
 }
@@ -940,7 +942,7 @@ def oauth_token(
     manual_code: str | None = None,
 ) -> str:
     meta = PROVIDERS[provider]
-    client_id = client_id or os.environ.get(meta.get("env_client_id", ""))
+    client_id = client_id or os.environ.get(meta.get("env_client_id", "")) or meta.get("default_client_id")
     if not client_id:
         raise SystemExit(f"Missing {meta['display']} OAuth client id. Pass --client-id or set {meta.get('env_client_id', '')}.")
     if provider == "github":

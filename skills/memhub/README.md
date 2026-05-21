@@ -35,7 +35,13 @@ python scripts/memhub.py --repo "$MEMHUB_REPO" init --name dateng --role "Produc
 
 ### GitHub Device Flow
 
-发布版应内置 OAuth App client id；开发版可通过环境变量、home 目录 `.env`、当前目录 `.env` 或参数传入：
+MemHub 已内置 GitHub OAuth App client id。普通用户不需要配置 GitHub client id，只需要在 GitHub 授权页面确认权限：
+
+```bash
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup github --repo-name mymemhub
+```
+
+开发者如需覆盖内置 OAuth App，可通过环境变量、home 目录 `.env`、当前目录 `.env` 或 `--client-id` 传入：
 
 ```bash
 export MEMHUB_GITHUB_CLIENT_ID=<github-oauth-app-client-id>
@@ -44,8 +50,9 @@ python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup github --repo-name mym
 
 ### Gitee Authorization Code
 
+MemHub 可内置 Gitee OAuth App client id；但 Gitee Authorization Code Flow 仍需要 client secret。公开 Skill 包不会内置 secret，普通用户免配置 Gitee 需要后续 MemHub Cloud/OAuth broker。
+
 ```bash
-export MEMHUB_GITEE_CLIENT_ID=<gitee-oauth-app-client-id>
 export MEMHUB_GITEE_CLIENT_SECRET=<gitee-oauth-app-client-secret>
 python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup gitee --repo-name mymemhub
 ```

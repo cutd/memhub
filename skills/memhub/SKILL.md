@@ -1,6 +1,6 @@
 ---
 name: memhub
-version: 0.1.2
+version: 0.1.3
 description: 使用 MemHub Protocol v0.1 读写用户的跨 Agent 统一记忆仓库。当用户要求记住信息、读取个人/项目上下文、生成 chatbot 注入文本、同步 Git 记忆仓库时使用。
 tags:
   - memory
@@ -37,10 +37,13 @@ export MEMHUB_REPO=/path/to/memhub-data
 同步 setup 可选使用：
 
 ```bash
-# OAuth app 配置
+# GitHub Device Flow 已内置 MemHub OAuth App client id；普通用户通常无需设置
+# Gitee 可内置 client id，但 Authorization Code Flow 仍需要 client secret；公开 skill 包不会内置 secret
+export MEMHUB_GITEE_CLIENT_SECRET=...
+
+# 如需覆盖内置 OAuth App，开发者可设置：
 export MEMHUB_GITHUB_CLIENT_ID=...
 export MEMHUB_GITEE_CLIENT_ID=...
-export MEMHUB_GITEE_CLIENT_SECRET=...
 
 # Token fallback
 export MEMHUB_GITHUB_TOKEN=...

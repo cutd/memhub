@@ -43,6 +43,16 @@ python scripts/memhub.py --repo ~/memhub-data context --pack brief
 python scripts/memhub.py --repo ~/memhub-data remember "用户偏好结构化直接的回答" --type preference --source hermes
 python scripts/memhub.py --repo ~/memhub-data remember "MemHub 采用 Git-first 架构" --type decision --project memhub --source hermes
 
+# 检查 inbox
+python scripts/memhub.py --repo ~/memhub-data inbox list
+python scripts/memhub.py --repo ~/memhub-data inbox list --status all
+python scripts/memhub.py --repo ~/memhub-data inbox show <filename-or-id-fragment>
+
+# 将 inbox 半自动归档到 canonical memory
+python scripts/memhub.py --repo ~/memhub-data promote --dry-run
+python scripts/memhub.py --repo ~/memhub-data promote --apply
+python scripts/memhub.py --repo ~/memhub-data promote <filename-or-id-fragment> --apply
+
 # 导出给 chatbot 的上下文
 python scripts/memhub.py --repo ~/memhub-data export chatbot
 
@@ -85,6 +95,30 @@ python scripts/memhub.py --repo "$MEMHUB_REPO" remember "内容" --type fact --s
 ### 对话结束
 
 如果对话中产生了重要决策、偏好或事实，可以写入 inbox，然后执行 sync。
+
+### Canonical 归档
+
+默认不要直接写 canonical memory。需要整理长期记忆时，先预览：
+
+```bash
+python scripts/memhub.py --repo "$MEMHUB_REPO" inbox list
+python scripts/memhub.py --repo "$MEMHUB_REPO" promote --dry-run
+```
+
+确认归档目标合理后再执行：
+
+```bash
+python scripts/memhub.py --repo "$MEMHUB_REPO" promote --apply
+```
+
+当前最小归档规则：
+
+- `decision` → `projects/<project>/decisions.yaml`
+- `preference` → `identity/preferences.yaml`
+- `constraint` → `identity/constraints.yaml`
+- `convention` → `identity/conventions.yaml`
+- `knowledge` → `knowledge/product.yaml`
+- `fact` / `event` → `timeline/YYYY-MM.yaml`
 
 不要写入：
 

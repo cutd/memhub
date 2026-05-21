@@ -312,6 +312,220 @@ def remember(repo: Path, content: str, type_: str = "fact", source_client: str =
     return file
 
 
+
+def inbox_files(repo: Path, status: str | None = "pending") -> list[Path]:
+    files = sorted((repo / "inbox").glob("*.yaml"))
+    if status in (None, "all"):
+        return files
+    out: list[Path] = []
+    for path in files:
+        data = read_yaml(path, {})
+        if data.get("status", "pending") == status:
+            out.append(path)
+    return out
+
+
+def inbox_summary(path: Path) -> str:
+    data = read_yaml(path, {})
+    items = data.get("items", []) or []
+    status = data.get("status", "pending")
+    created = str(data.get("created_at", ""))[:19]
+    source = (data.get("source") or {}).get("client", "")
+    first = items[0] if items else {}
+    type_ = first.get("type", "")
+    content = str(first.get("content", "")).replace("\n", " ")
+    if len(content) > 90:
+        content = content[:87] + "..."
+    return f"{path.name}\t{status}\t{type_}\t{source}\t{created}\t{content}"
+
+
+def inbox_list(repo: Path, status: str | None = "pending") -> str:
+    files = inbox_files(repo, status=status)
+    if not files:
+        return "No inbox items found.\n"
+    lines = ["file\tstatus\ttype\tsource\tcreated_at\tcontent"]
+    lines.extend(inbox_summary(path) for path in files)
+    return "\n".join(lines) + "\n"
+
+
+def resolve_inbox_file(repo: Path, ref: str) -> Path:
+    direct = Path(ref)
+    candidates: list[Path] = []
+    if direct.is_absolute() and direct.exists():
+        candidates.append(direct)
+    candidates.extend([
+        repo / "inbox" / ref,
+        repo / "inbox" / (ref if ref.endswith(".yaml") else f"{ref}.yaml"),
+    ])
+    candidates.extend(sorted((repo / "inbox").glob(f"*{ref}*.yaml")))
+    seen: set[Path] = set()
+    unique = []
+    for c in candidates:
+        c = c.resolve()
+        if c.exists() and c not in seen:
+            unique.append(c)
+            seen.add(c)
+    if not unique:
+        raise SystemExit(f"Inbox item not found: {ref}")
+    if len(unique) > 1:
+        names = ", ".join(x.name for x in unique[:5])
+        raise SystemExit(f"Ambiguous inbox ref: {ref}. Matches: {names}")
+    return unique[0]
+
+
+def inbox_show(repo: Path, ref: str) -> str:
+    path = resolve_inbox_file(repo, ref)
+    return path.read_text(encoding="utf-8")
+
+
+def item_project(item: dict[str, Any]) -> str | None:
+    target = item.get("suggested_target") or ""
+    parts = str(target).split("/")
+    if len(parts) >= 3 and parts[0] == "projects":
+        return parts[1]
+    return None
+
+
+def suggested_target_for_item(repo: Path, item: dict[str, Any]) -> Path:
+    type_ = item.get("type", "fact")
+    if item.get("suggested_target"):
+        return repo / str(item["suggested_target"])
+    if type_ == "decision":
+        project = item_project(item) or get_default_project(repo) or "memhub"
+        return repo / f"projects/{project}/decisions.yaml"
+    if type_ == "preference":
+        return repo / "identity/preferences.yaml"
+    if type_ == "constraint":
+        return repo / "identity/constraints.yaml"
+    if type_ == "convention":
+        return repo / "identity/conventions.yaml"
+    if type_ == "knowledge":
+        return repo / "knowledge/product.yaml"
+    if type_ in {"event", "fact"}:
+        return repo / f"timeline/{today_month()}.yaml"
+    return repo / "knowledge/product.yaml"
+
+
+def canonical_entry(item: dict[str, Any], inbox_data: dict[str, Any], source_path: Path) -> dict[str, Any]:
+    source = inbox_data.get("source") or {}
+    return {
+        "id": item.get("id") or f"mem_{timestamp_id()}_{short_id()}",
+        "type": item.get("type", "fact"),
+        "status": "active",
+        "content": item.get("content", ""),
+        "confidence": item.get("confidence", 0.8),
+        "importance": item.get("importance", 0.6),
+        "source": source,
+        "created_at": item.get("created_at") or inbox_data.get("created_at") or now_iso(),
+        "promoted_at": now_iso(),
+        "inbox_ref": source_path.name,
+    }
+
+
+def append_unique(container: dict[str, Any], key: str, entry: dict[str, Any]) -> bool:
+    items = container.setdefault(key, [])
+    content = entry.get("content")
+    for existing in items:
+        if existing.get("content") == content:
+            return False
+    items.insert(0, entry)
+    container["updated_at"] = now_iso()
+    return True
+
+
+def apply_item_to_target(repo: Path, target: Path, item: dict[str, Any], inbox_data: dict[str, Any], source_path: Path) -> bool:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    data = read_yaml(target, {}) or {}
+    rel = target.relative_to(repo).as_posix()
+    entry = canonical_entry(item, inbox_data, source_path)
+    type_ = item.get("type", "fact")
+
+    if rel.startswith("projects/") and rel.endswith("/decisions.yaml"):
+        data.setdefault("schema_version", SCHEMA_VERSION)
+        if "project_id" not in data:
+            data["project_id"] = rel.split("/")[1]
+        changed = append_unique(data, "decisions", entry)
+    elif rel == "identity/preferences.yaml":
+        data.setdefault("schema_version", SCHEMA_VERSION)
+        changed = append_unique(data, "preferences", entry)
+    elif rel == "identity/constraints.yaml":
+        data.setdefault("schema_version", SCHEMA_VERSION)
+        changed = append_unique(data, "constraints", entry)
+    elif rel == "identity/conventions.yaml":
+        data.setdefault("schema_version", SCHEMA_VERSION)
+        changed = append_unique(data, "conventions", entry)
+    elif rel.startswith("knowledge/"):
+        data.setdefault("schema_version", SCHEMA_VERSION)
+        data.setdefault("domain", target.stem)
+        changed = append_unique(data, "items", entry)
+    elif rel.startswith("timeline/"):
+        data.setdefault("schema_version", SCHEMA_VERSION)
+        data.setdefault("month", target.stem)
+        event = dict(entry)
+        event.setdefault("date", str(entry.get("created_at", ""))[:10])
+        changed = append_unique(data, "events", event)
+    else:
+        data.setdefault("schema_version", SCHEMA_VERSION)
+        changed = append_unique(data, "items", entry)
+
+    if changed:
+        write_yaml(target, data)
+    return changed
+
+
+def promote_plan(repo: Path, refs: list[str] | None = None, status: str = "pending") -> list[tuple[Path, dict[str, Any], dict[str, Any], Path]]:
+    if refs:
+        files = [resolve_inbox_file(repo, ref) for ref in refs]
+    else:
+        files = inbox_files(repo, status=status)
+    plan: list[tuple[Path, dict[str, Any], dict[str, Any], Path]] = []
+    for path in files:
+        data = read_yaml(path, {}) or {}
+        if status != "all" and data.get("status", "pending") != status and not refs:
+            continue
+        for item in data.get("items", []) or []:
+            if item.get("status", "pending") not in {"pending", "accepted"}:
+                continue
+            target = suggested_target_for_item(repo, item)
+            plan.append((path, data, item, target))
+    return plan
+
+
+def promote(repo: Path, refs: list[str] | None = None, apply: bool = False, status: str = "pending") -> str:
+    plan = promote_plan(repo, refs=refs, status=status)
+    if not plan:
+        return "No promotable inbox items found.\n"
+
+    lines = ["Promote plan:"]
+    changed_files: set[Path] = set()
+    touched_inbox: dict[Path, dict[str, Any]] = {}
+    for path, data, item, target in plan:
+        rel_target = target.relative_to(repo).as_posix()
+        content = str(item.get("content", ""))
+        lines.append(f"- {path.name} :: {item.get('type', 'fact')} -> {rel_target}")
+        lines.append(f"  content: {content}")
+        if apply:
+            changed = apply_item_to_target(repo, target, item, data, path)
+            item["status"] = "promoted"
+            item["promoted_at"] = now_iso()
+            item["promoted_to"] = rel_target
+            touched_inbox[path] = data
+            if changed:
+                changed_files.add(target)
+
+    if apply:
+        for path, data in touched_inbox.items():
+            items = data.get("items", []) or []
+            if items and all(item.get("status") == "promoted" for item in items):
+                data["status"] = "promoted"
+            data["updated_at"] = now_iso()
+            write_yaml(path, data)
+        commit_all(repo, "memhub: promote inbox to canonical")
+        lines.append(f"Applied. Updated {len(changed_files)} canonical file(s), marked {len(touched_inbox)} inbox file(s).")
+    else:
+        lines.append("Dry run only. Re-run with --apply to write canonical files and mark inbox items promoted.")
+    return "\n".join(lines) + "\n"
+
 def export_chatbot(repo: Path, project: str | None = None) -> Path:
     content = build_context(repo, project=project, pack="brief")
     out = repo / "exports/chatbot.md"
@@ -367,6 +581,19 @@ def main(argv: list[str] | None = None) -> int:
     p_rem.add_argument("--source", default="manual")
     p_rem.add_argument("--project", default=None)
 
+    p_inbox = sub.add_parser("inbox", help="Inspect inbox items")
+    inbox_sub = p_inbox.add_subparsers(dest="inbox_cmd", required=True)
+    p_inbox_list = inbox_sub.add_parser("list", help="List inbox items")
+    p_inbox_list.add_argument("--status", default="pending", choices=["pending", "promoted", "all"])
+    p_inbox_show = inbox_sub.add_parser("show", help="Show one inbox YAML file")
+    p_inbox_show.add_argument("ref")
+
+    p_promote = sub.add_parser("promote", help="Promote inbox items into canonical memory")
+    p_promote.add_argument("refs", nargs="*", help="Optional inbox filename/id substrings. Defaults to all pending items.")
+    p_promote.add_argument("--dry-run", action="store_true", help="Preview only; this is the default unless --apply is set")
+    p_promote.add_argument("--apply", action="store_true", help="Write canonical files and mark inbox items promoted")
+    p_promote.add_argument("--status", default="pending", choices=["pending", "all"], help="Inbox status to scan when refs are omitted")
+
     p_export = sub.add_parser("export", help="Export context")
     p_export.add_argument("target", choices=["chatbot"])
     p_export.add_argument("--project", default=None)
@@ -384,6 +611,14 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "remember":
         file = remember(repo, args.content, type_=args.type, source_client=args.source, project=args.project)
         print(f"Wrote inbox item: {file}")
+    elif args.cmd == "inbox":
+        if args.inbox_cmd == "list":
+            print(inbox_list(repo, status=args.status), end="")
+        elif args.inbox_cmd == "show":
+            print(inbox_show(repo, args.ref), end="")
+    elif args.cmd == "promote":
+        refs = args.refs if args.refs else None
+        print(promote(repo, refs=refs, apply=args.apply, status=args.status), end="")
     elif args.cmd == "export":
         out = export_chatbot(repo, project=args.project)
         print(f"Exported chatbot context: {out}")

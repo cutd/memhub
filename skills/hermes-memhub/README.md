@@ -30,6 +30,10 @@ python scripts/memhub.py --repo "$MEMHUB_REPO" init --name dateng --role "Produc
 ```bash
 python scripts/memhub.py --repo "$MEMHUB_REPO" context
 python scripts/memhub.py --repo "$MEMHUB_REPO" remember "要记住的内容" --type fact --source hermes
+python scripts/memhub.py --repo "$MEMHUB_REPO" inbox list
+python scripts/memhub.py --repo "$MEMHUB_REPO" inbox show <filename-or-id-fragment>
+python scripts/memhub.py --repo "$MEMHUB_REPO" promote --dry-run
+python scripts/memhub.py --repo "$MEMHUB_REPO" promote --apply
 python scripts/memhub.py --repo "$MEMHUB_REPO" export chatbot
 python scripts/memhub.py --repo "$MEMHUB_REPO" sync
 ```

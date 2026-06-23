@@ -257,6 +257,8 @@ def init_repo(repo: Path, name: str = "user", role: str = "") -> None:
 
     gitignore = """# MemHub generated local indexes/caches and secrets\n.memhub/cache/\n.memhub/indexes/\n.memhub/secrets.yaml\n.memhub/secrets/\n*.db\n.DS_Store\n"""
     write_text(repo / ".gitignore", gitignore)
+    write_text(repo / ".gitattributes", GITATTRIBUTES_CONTENT)
+    ensure_merge_driver_registered(repo)
 
     commit_all(repo, "memhub: init repository")
 
@@ -271,19 +273,122 @@ def get_default_project(repo: Path) -> str | None:
     return None
 
 
-def build_context(repo: Path, project: str | None = None, pack: str = "standard") -> str:
-    profile = read_yaml(repo / "identity/profile.yaml", {})
-    prefs = read_yaml(repo / "identity/preferences.yaml", {})
+# Per-pack limits for list sections. "project" focuses on one project and is
+# otherwise close to "standard" for the identity sections.
+PACK_LIMITS: dict[str, dict[str, int]] = {
+    "brief": {"preferences": 3, "decisions": 3, "constraints": 0, "conventions": 0,
+              "knowledge": 0, "relations": 0, "timeline": 0, "tasks": 0},
+    "standard": {"preferences": 8, "decisions": 8, "constraints": 5, "conventions": 5,
+                 "knowledge": 0, "relations": 0, "timeline": 0, "tasks": 5},
+    "full": {"preferences": 12, "decisions": 12, "constraints": 10, "conventions": 10,
+             "knowledge": 10, "relations": 10, "timeline": 8, "tasks": 10},
+    "project": {"preferences": 5, "decisions": 12, "constraints": 5, "conventions": 5,
+                "knowledge": 0, "relations": 0, "timeline": 0, "tasks": 12},
+}
+
+
+def _entry_label(item: dict[str, Any]) -> str:
+    """Best-effort one-line label for a canonical entry across schemas."""
+    content = item.get("content")
+    if content:
+        return str(content)
+    key = item.get("key") or item.get("name") or item.get("title") or item.get("id")
+    value = item.get("value") or item.get("summary") or item.get("description")
+    if key and value:
+        return f"{key}: {value}"
+    return str(key or value or "")
+
+
+def _active_sorted(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    active = [x for x in items if x.get("status", "active") == "active"]
+    active.sort(key=lambda x: x.get("importance", 0), reverse=True)
+    return active[:limit] if limit else active
+
+
+def latest_timeline_events(repo: Path, limit: int) -> list[dict[str, Any]]:
+    if not limit:
+        return []
+    events: list[dict[str, Any]] = []
+    for path in sorted((repo / "timeline").glob("*.yaml"), reverse=True):
+        data = read_yaml(path, {}) or {}
+        events.extend(data.get("events", []) or [])
+        if len(events) >= limit:
+            break
+    events.sort(key=lambda e: str(e.get("date") or e.get("created_at") or ""), reverse=True)
+    return events[:limit]
+
+
+def context_model(repo: Path, project: str | None = None, pack: str = "standard") -> dict[str, Any]:
+    """Assemble the data the context pack renders from. Used by both the built-in
+    Markdown renderer and the optional user template."""
+    limits = PACK_LIMITS.get(pack, PACK_LIMITS["standard"])
+    profile = read_yaml(repo / "identity/profile.yaml", {}) or {}
+    prefs = read_yaml(repo / "identity/preferences.yaml", {}) or {}
+    conventions = read_yaml(repo / "identity/conventions.yaml", {}) or {}
+    constraints = read_yaml(repo / "identity/constraints.yaml", {}) or {}
     project_id = project or get_default_project(repo)
+
+    model: dict[str, Any] = {
+        "pack": pack,
+        "generated_at": now_iso(),
+        "profile": profile.get("profile", {}),
+        "communication": profile.get("communication", {}),
+        "preferences": _active_sorted(prefs.get("preferences", []) or [], limits["preferences"]),
+        "constraints": _active_sorted(constraints.get("constraints", []) or [], limits["constraints"]),
+        "conventions": _active_sorted(conventions.get("conventions", []) or [], limits["conventions"]),
+        "project": {},
+        "decisions": [],
+        "tasks": [],
+        "knowledge": [],
+        "relations": {},
+        "timeline": latest_timeline_events(repo, limits["timeline"]),
+        "project_id": project_id,
+    }
+
+    if project_id:
+        ctx = read_yaml(repo / f"projects/{project_id}/context.yaml", {}) or {}
+        decisions = read_yaml(repo / f"projects/{project_id}/decisions.yaml", {}) or {}
+        tasks = read_yaml(repo / f"projects/{project_id}/tasks.yaml", {}) or {}
+        model["project"] = ctx.get("project", {})
+        model["decisions"] = (decisions.get("decisions", []) or [])[:limits["decisions"]]
+        open_tasks = [t for t in (tasks.get("tasks", []) or []) if t.get("status") not in {"done", "cancelled"}]
+        model["tasks"] = open_tasks[:limits["tasks"]]
+
+    if limits["knowledge"]:
+        kn: list[dict[str, Any]] = []
+        for path in sorted((repo / "knowledge").glob("*.yaml")):
+            if path.name == "index.yaml":
+                continue
+            data = read_yaml(path, {}) or {}
+            for item in (data.get("items", []) or []):
+                entry = dict(item)
+                entry.setdefault("domain", data.get("domain", path.stem))
+                kn.append(entry)
+        model["knowledge"] = _active_sorted(kn, limits["knowledge"])
+
+    if limits["relations"]:
+        rel: dict[str, list[dict[str, Any]]] = {}
+        for kind, key in (("people", "people"), ("orgs", "orgs"), ("tools", "tools")):
+            data = read_yaml(repo / f"relations/{kind}.yaml", {}) or {}
+            items = (data.get(key, []) or [])[:limits["relations"]]
+            if items:
+                rel[kind] = items
+        model["relations"] = rel
+
+    return model
+
+
+def build_context(repo: Path, project: str | None = None, pack: str = "standard") -> str:
+    m = context_model(repo, project=project, pack=pack)
+    p = m["profile"]
+    c = m["communication"]
 
     lines: list[str] = []
     lines.append("# MemHub Context Pack")
     lines.append("")
-    lines.append("<!-- Auto-generated by MemHub. Treat as user-auditable memory, not absolute truth. -->")
+    lines.append(f"<!-- Auto-generated by MemHub (pack: {m['pack']}). Treat as user-auditable memory, not absolute truth. -->")
     lines.append("")
 
-    p = profile.get("profile", {})
-    c = profile.get("communication", {})
     lines.append("## User")
     lines.append(f"- Name: {p.get('name') or ''}")
     if p.get("role"):
@@ -300,20 +405,27 @@ def build_context(repo: Path, project: str | None = None, pack: str = "standard"
         lines.append("- Dislikes: " + ", ".join(c.get("dislikes", [])))
     lines.append("")
 
-    pref_items = prefs.get("preferences", [])
-    active_prefs = [x for x in pref_items if x.get("status", "active") == "active"]
-    active_prefs.sort(key=lambda x: x.get("importance", 0), reverse=True)
-    if active_prefs:
+    if m["preferences"]:
         lines.append("## Important Preferences")
-        for item in active_prefs[:8 if pack != "brief" else 3]:
-            lines.append(f"- {item.get('content') or item.get('key') + ': ' + str(item.get('value'))}")
+        for item in m["preferences"]:
+            lines.append(f"- {_entry_label(item)}")
         lines.append("")
 
-    if project_id:
-        ctx = read_yaml(repo / f"projects/{project_id}/context.yaml", {})
-        decisions = read_yaml(repo / f"projects/{project_id}/decisions.yaml", {})
-        proj = ctx.get("project", {})
-        lines.append(f"## Current Project: {proj.get('name', project_id)}")
+    if m["constraints"]:
+        lines.append("## Constraints")
+        for item in m["constraints"]:
+            lines.append(f"- {_entry_label(item)}")
+        lines.append("")
+
+    if m["conventions"]:
+        lines.append("## Conventions")
+        for item in m["conventions"]:
+            lines.append(f"- {_entry_label(item)}")
+        lines.append("")
+
+    proj = m["project"]
+    if m["project_id"]:
+        lines.append(f"## Current Project: {proj.get('name', m['project_id'])}")
         if proj.get("description"):
             lines.append(f"- Description: {proj.get('description')}")
         if proj.get("current_phase"):
@@ -326,46 +438,228 @@ def build_context(repo: Path, project: str | None = None, pack: str = "standard"
             lines.append("- Constraints:")
             for con in proj.get("constraints", [])[:5]:
                 lines.append(f"  - {con}")
-        decs = decisions.get("decisions", [])
-        if decs:
+        if m["decisions"]:
             lines.append("")
             lines.append("### Recent Decisions")
-            for d in decs[:8 if pack != "brief" else 3]:
-                lines.append(f"- [{d.get('created_at', '')[:10]}] {d.get('content')}")
+            for d in m["decisions"]:
+                lines.append(f"- [{str(d.get('created_at', ''))[:10]}] {_entry_label(d)}")
+        if m["tasks"]:
+            lines.append("")
+            lines.append("### Open Tasks")
+            for t in m["tasks"]:
+                status = t.get("status", "")
+                suffix = f" ({status})" if status else ""
+                lines.append(f"- {_entry_label(t)}{suffix}")
+        lines.append("")
+
+    if m["knowledge"]:
+        lines.append("## Knowledge")
+        for item in m["knowledge"]:
+            domain = item.get("domain")
+            prefix = f"[{domain}] " if domain else ""
+            lines.append(f"- {prefix}{_entry_label(item)}")
+        lines.append("")
+
+    if m["relations"]:
+        lines.append("## Relations")
+        for kind in ("people", "orgs", "tools"):
+            items = m["relations"].get(kind)
+            if not items:
+                continue
+            lines.append(f"- {kind.capitalize()}:")
+            for item in items:
+                name = item.get("name") or item.get("id") or item.get("content") or ""
+                note = item.get("role") or item.get("relation") or item.get("note") or item.get("description") or ""
+                lines.append(f"  - {name}" + (f" — {note}" if note else ""))
+        lines.append("")
+
+    if m["timeline"]:
+        lines.append("## Recent Timeline")
+        for e in m["timeline"]:
+            date = str(e.get("date") or e.get("created_at") or "")[:10]
+            lines.append(f"- [{date}] {_entry_label(e)}")
         lines.append("")
 
     return "\n".join(lines).strip() + "\n"
 
 
-def remember(repo: Path, content: str, type_: str = "fact", source_client: str = "manual", project: str | None = None) -> Path:
+def build_item(content: str, type_: str = "fact", project: str | None = None) -> dict[str, Any]:
+    """Build a single memory item dict shared by direct-write and inbox capture."""
+    sid = short_id()
+    return {
+        "id": f"mem_{timestamp_id()}_{sid}",
+        "type": type_,
+        "scope": "project" if project else "inbox",
+        "status": "pending",
+        "content": content,
+        "suggested_target": f"projects/{project}/decisions.yaml" if type_ == "decision" and project else None,
+        "confidence": 0.8,
+        "importance": 0.6,
+        "created_at": now_iso(),
+    }
+
+
+def remember_inbox(repo: Path, content: str, type_: str = "fact", source_client: str = "manual", project: str | None = None) -> Path:
+    """Capture into the inbox tier (audit buffer). One file per capture."""
     ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     sid = short_id()
-    item_id = f"mem_{timestamp_id()}_{sid}"
+    item = build_item(content, type_=type_, project=project)
     file = repo / "inbox" / f"{ts}-{source_client}-{sid}.yaml"
-    item = {
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "inbox_id": f"inbox_{timestamp_id()}_{sid}",
         "status": "pending",
         "created_at": now_iso(),
         "source": {"client": source_client},
-        "items": [
-            {
-                "id": item_id,
-                "type": type_,
-                "scope": "project" if project else "inbox",
-                "status": "pending",
-                "content": content,
-                "suggested_target": f"projects/{project}/decisions.yaml" if type_ == "decision" and project else None,
-                "confidence": 0.8,
-                "importance": 0.6,
-                "created_at": now_iso(),
-            }
-        ],
+        "items": [item],
     }
-    write_yaml(file, item)
+    write_yaml(file, payload)
     commit_all(repo, f"memhub: add inbox/{type_}: {content[:50]}")
     return file
 
+
+def remember_direct(repo: Path, content: str, type_: str = "fact", source_client: str = "manual", project: str | None = None) -> tuple[Path, bool]:
+    """Write straight into canonical memory (default). Returns (target, changed)."""
+    item = build_item(content, type_=type_, project=project)
+    item["source"] = {"client": source_client}
+    target = suggested_target_for_item(repo, item)
+    inbox_data = {"source": {"client": source_client}, "created_at": item["created_at"]}
+    changed = apply_item_to_target(repo, target, item, inbox_data=inbox_data, source_path=None)
+    if changed:
+        commit_all(repo, f"memhub: remember {type_}: {content[:50]}")
+    return target, changed
+
+
+def remember(repo: Path, content: str, type_: str = "fact", source_client: str = "manual", project: str | None = None, to_inbox: bool = False) -> str:
+    """Default: write canonical memory directly. With `to_inbox`, capture to inbox tier."""
+    if to_inbox:
+        file = remember_inbox(repo, content, type_=type_, source_client=source_client, project=project)
+        return f"Captured to inbox: {file}"
+    target, changed = remember_direct(repo, content, type_=type_, source_client=source_client, project=project)
+    rel = target.relative_to(repo).as_posix()
+    if changed:
+        return f"Remembered ({type_}) -> {rel}"
+    return f"Already present ({type_}) in {rel}; skipped duplicate."
+
+
+# --- Canonical file walk: search / forget ------------------------------------
+
+# Canonical files and the list key each one stores entries under.
+CANONICAL_SOURCES: tuple[tuple[str, str], ...] = (
+    ("identity/preferences.yaml", "preferences"),
+    ("identity/constraints.yaml", "constraints"),
+    ("identity/conventions.yaml", "conventions"),
+    ("knowledge/*.yaml", "items"),
+    ("relations/people.yaml", "people"),
+    ("relations/orgs.yaml", "orgs"),
+    ("relations/tools.yaml", "tools"),
+    ("timeline/*.yaml", "events"),
+    ("projects/*/decisions.yaml", "decisions"),
+    ("projects/*/tasks.yaml", "tasks"),
+    ("projects/*/stack.yaml", "stack"),
+)
+
+
+def iter_canonical_entries(repo: Path):
+    """Yield (path, list_key, index, entry) for every canonical entry."""
+    for pattern, key in CANONICAL_SOURCES:
+        if "*" in pattern:
+            paths = sorted(repo.glob(pattern))
+        else:
+            p = repo / pattern
+            paths = [p] if p.exists() else []
+        for path in paths:
+            if path.name == "index.yaml":
+                continue
+            data = read_yaml(path, {}) or {}
+            for idx, entry in enumerate(data.get(key, []) or []):
+                if isinstance(entry, dict):
+                    yield path, key, idx, entry
+
+
+def _entry_project(repo: Path, path: Path) -> str | None:
+    rel = path.relative_to(repo).as_posix()
+    parts = rel.split("/")
+    return parts[1] if len(parts) >= 3 and parts[0] == "projects" else None
+
+
+def search(repo: Path, query: str, type_: str | None = None, project: str | None = None, limit: int = 20, include_archived: bool = False) -> str:
+    q = _normalize_content(query)
+    matches: list[tuple[float, str, dict[str, Any]]] = []
+    for path, _key, _idx, entry in iter_canonical_entries(repo):
+        if not include_archived and entry.get("status", "active") != "active":
+            continue
+        if type_ and entry.get("type") != type_:
+            continue
+        if project and _entry_project(repo, path) != project:
+            continue
+        label = _entry_label(entry)
+        if q and q not in _normalize_content(label) and q not in _normalize_content(entry.get("type")):
+            continue
+        rel = path.relative_to(repo).as_posix()
+        matches.append((float(entry.get("importance", 0) or 0), rel, entry))
+    if not matches:
+        return "No matching memory found.\n"
+    matches.sort(key=lambda m: m[0], reverse=True)
+    lines = ["importance\ttype\tsource\tfile\tcontent"]
+    for importance, rel, entry in matches[:limit]:
+        src = (entry.get("source") or {}).get("client", "")
+        content = _entry_label(entry).replace("\n", " ")
+        if len(content) > 90:
+            content = content[:87] + "..."
+        lines.append(f"{importance:.2f}\t{entry.get('type', '')}\t{src}\t{rel}\t{content}")
+    if len(matches) > limit:
+        lines.append(f"... {len(matches) - limit} more (raise --limit to see all)")
+    return "\n".join(lines) + "\n"
+
+
+def forget(repo: Path, query: str, type_: str | None = None, project: str | None = None, apply: bool = False) -> str:
+    """Soft-archive matching canonical entries (status -> archived)."""
+    q = _normalize_content(query)
+    # Group hits per file so we write each file once.
+    hits: dict[Path, list[tuple[str, int, dict[str, Any]]]] = {}
+    for path, key, idx, entry in iter_canonical_entries(repo):
+        if entry.get("status", "active") != "active":
+            continue
+        if type_ and entry.get("type") != type_:
+            continue
+        if project and _entry_project(repo, path) != project:
+            continue
+        eid = str(entry.get("id") or "")
+        label = _normalize_content(_entry_label(entry))
+        if q and q != eid and q not in label:
+            continue
+        hits.setdefault(path, []).append((key, idx, entry))
+    if not hits:
+        return "No matching active memory to forget.\n"
+
+    lines = ["Forget plan (soft-archive):"]
+    total = 0
+    for path in sorted(hits):
+        rel = path.relative_to(repo).as_posix()
+        for _key, _idx, entry in hits[path]:
+            total += 1
+            content = _entry_label(entry).replace("\n", " ")
+            if len(content) > 80:
+                content = content[:77] + "..."
+            lines.append(f"- {rel} :: {entry.get('type', '')} :: {content}")
+
+    if not apply:
+        lines.append(f"Dry run only. {total} entr{'y' if total == 1 else 'ies'} would be archived. Re-run with --apply.")
+        return "\n".join(lines) + "\n"
+
+    for path in hits:
+        data = read_yaml(path, {}) or {}
+        for key, idx, _entry in hits[path]:
+            items = data.get(key, []) or []
+            if 0 <= idx < len(items) and isinstance(items[idx], dict):
+                items[idx]["status"] = "archived"
+                items[idx]["archived_at"] = now_iso()
+        data["updated_at"] = now_iso()
+        write_yaml(path, data)
+    commit_all(repo, f"memhub: forget (archive) {total} entr{'y' if total == 1 else 'ies'}")
+    lines.append(f"Applied. Archived {total} entr{'y' if total == 1 else 'ies'}.")
+    return "\n".join(lines) + "\n"
 
 
 def inbox_files(repo: Path, status: str | None = "pending") -> list[Path]:
@@ -456,14 +750,17 @@ def suggested_target_for_item(repo: Path, item: dict[str, Any]) -> Path:
         return repo / "identity/conventions.yaml"
     if type_ == "knowledge":
         return repo / "knowledge/product.yaml"
+    if type_ == "relation":
+        return repo / "relations/people.yaml"
     if type_ in {"event", "fact"}:
         return repo / f"timeline/{today_month()}.yaml"
     return repo / "knowledge/product.yaml"
 
 
-def canonical_entry(item: dict[str, Any], inbox_data: dict[str, Any], source_path: Path) -> dict[str, Any]:
+def canonical_entry(item: dict[str, Any], inbox_data: dict[str, Any], source_path: Path | None = None) -> dict[str, Any]:
+    inbox_data = inbox_data or {}
     source = inbox_data.get("source") or {}
-    return {
+    entry = {
         "id": item.get("id") or f"mem_{timestamp_id()}_{short_id()}",
         "type": item.get("type", "fact"),
         "status": "active",
@@ -472,23 +769,32 @@ def canonical_entry(item: dict[str, Any], inbox_data: dict[str, Any], source_pat
         "importance": item.get("importance", 0.6),
         "source": source,
         "created_at": item.get("created_at") or inbox_data.get("created_at") or now_iso(),
-        "promoted_at": now_iso(),
-        "inbox_ref": source_path.name,
     }
+    # `inbox_ref`/`promoted_at` only make sense when the entry came through the
+    # inbox tier. A direct `remember` writes canonical memory with no inbox file.
+    if source_path is not None:
+        entry["promoted_at"] = now_iso()
+        entry["inbox_ref"] = source_path.name
+    return entry
+
+
+def _normalize_content(value: Any) -> str:
+    """Normalize an entry's content for dedup: collapse whitespace and casefold."""
+    return " ".join(str(value or "").split()).casefold()
 
 
 def append_unique(container: dict[str, Any], key: str, entry: dict[str, Any]) -> bool:
     items = container.setdefault(key, [])
-    content = entry.get("content")
+    content = _normalize_content(entry.get("content"))
     for existing in items:
-        if existing.get("content") == content:
+        if content and _normalize_content(existing.get("content")) == content:
             return False
     items.insert(0, entry)
     container["updated_at"] = now_iso()
     return True
 
 
-def apply_item_to_target(repo: Path, target: Path, item: dict[str, Any], inbox_data: dict[str, Any], source_path: Path) -> bool:
+def apply_item_to_target(repo: Path, target: Path, item: dict[str, Any], inbox_data: dict[str, Any] | None = None, source_path: Path | None = None) -> bool:
     target.parent.mkdir(parents=True, exist_ok=True)
     data = read_yaml(target, {}) or {}
     rel = target.relative_to(repo).as_posix()
@@ -513,6 +819,10 @@ def apply_item_to_target(repo: Path, target: Path, item: dict[str, Any], inbox_d
         data.setdefault("schema_version", SCHEMA_VERSION)
         data.setdefault("domain", target.stem)
         changed = append_unique(data, "items", entry)
+    elif rel.startswith("relations/"):
+        data.setdefault("schema_version", SCHEMA_VERSION)
+        key = target.stem  # people / orgs / tools
+        changed = append_unique(data, key, entry)
     elif rel.startswith("timeline/"):
         data.setdefault("schema_version", SCHEMA_VERSION)
         data.setdefault("month", target.stem)
@@ -1164,11 +1474,50 @@ def sync_status(repo: Path) -> str:
     lines.append(run_git(repo, ["status", "--short", "--branch"], check=False).stdout.strip())
     return "\n".join(lines).strip() + "\n"
 
+def _render_simple_template(tpl: str, values: dict[str, str]) -> str:
+    """Render a minimal `{{ key }}` template with stdlib only.
+
+    Intentionally tiny: supports `{{ name }}` substitution with optional inner
+    whitespace. Unknown placeholders render empty. This avoids a Jinja2 runtime
+    dependency while still letting users customize exports via the template file.
+    """
+    import re
+
+    def repl(match: "re.Match[str]") -> str:
+        return str(values.get(match.group(1).strip(), ""))
+
+    return re.sub(r"\{\{\s*([\w.]+)\s*\}\}", repl, tpl)
+
+
+def _template_values(repo: Path, project: str | None) -> dict[str, str]:
+    m = context_model(repo, project=project, pack="brief")
+    p = m["profile"]
+    c = m["communication"]
+    proj = m["project"]
+    proj_lines: list[str] = []
+    if m["project_id"]:
+        proj_lines.append(f"- {proj.get('name', m['project_id'])}: {proj.get('description', '')}".rstrip())
+        if proj.get("current_phase"):
+            proj_lines.append(f"- Phase: {proj['current_phase']}")
+    decisions = "\n".join(f"- {_entry_label(d)}" for d in m["decisions"]) or "- (none)"
+    return {
+        "name": p.get("name", ""),
+        "role": p.get("role", ""),
+        "style": c.get("preferred_style", "direct_structured"),
+        "project_context": "\n".join(proj_lines) or "- (none)",
+        "recent_decisions": decisions,
+    }
+
+
 def export_chatbot(repo: Path, project: str | None = None) -> Path:
-    content = build_context(repo, project=project, pack="brief")
+    template_path = repo / ".memhub/templates/context-pack.md.j2"
+    if template_path.exists():
+        body = _render_simple_template(template_path.read_text(encoding="utf-8"), _template_values(repo, project))
+    else:
+        body = build_context(repo, project=project, pack="brief")
     out = repo / "exports/chatbot.md"
     header = f"<!-- Auto-generated by MemHub. Generated at: {now_iso()} -->\n\n"
-    write_text(out, header + content)
+    write_text(out, header + body)
     commit_all(repo, "memhub: export chatbot context")
     return out
 
@@ -1182,30 +1531,170 @@ def commit_all(repo: Path, message: str) -> None:
         run_git(repo, ["-c", "user.name=MemHub", "-c", "user.email=memhub@example.local", "commit", "-m", message], check=False)
 
 
+# --- Structured merge driver -------------------------------------------------
+#
+# Canonical files are append-mostly YAML lists. A plain line-level union would
+# interleave multi-line entries and corrupt the YAML, so MemHub registers a
+# structured driver that merges the *lists* by entry identity. This lets two
+# devices that each appended memory auto-merge instead of hitting a conflict.
+
+# List keys that hold canonical entries and are safe to union-merge.
+MERGE_LIST_KEYS = (
+    "preferences", "constraints", "conventions", "decisions", "tasks",
+    "stack", "items", "events", "people", "orgs", "tools", "active_projects",
+)
+
+
+def _entry_key(entry: Any) -> str:
+    """Identity for dedup during merge: prefer id, else normalized content/name."""
+    if isinstance(entry, dict):
+        if entry.get("id"):
+            return f"id::{entry['id']}"
+        label = entry.get("content") or entry.get("name") or entry.get("key") or entry.get("title")
+        if label:
+            return f"c::{_normalize_content(label)}"
+    return f"raw::{_normalize_content(entry)}"
+
+
+def _union_lists(ours: list[Any], theirs: list[Any]) -> list[Any]:
+    """Union two entry lists by identity, keeping ours first then new theirs."""
+    out = list(ours)
+    seen = {_entry_key(e) for e in ours}
+    for entry in theirs:
+        key = _entry_key(entry)
+        if key not in seen:
+            out.append(entry)
+            seen.add(key)
+    return out
+
+
+def merge_yaml_docs(base: Any, ours: Any, theirs: Any) -> Any:
+    """Three-way merge for MemHub canonical YAML. Union known list keys, prefer
+    the newer side for scalars. `base` is currently unused but kept for the git
+    driver contract and future smarter merges."""
+    if not isinstance(ours, dict) or not isinstance(theirs, dict):
+        return ours if ours is not None else theirs
+    merged: dict[str, Any] = dict(ours)
+    for key, their_val in theirs.items():
+        if key not in merged:
+            merged[key] = their_val
+            continue
+        our_val = merged[key]
+        if key in MERGE_LIST_KEYS and isinstance(our_val, list) and isinstance(their_val, list):
+            merged[key] = _union_lists(our_val, their_val)
+    # Prefer the more recently updated side for the bookkeeping timestamp.
+    our_ts = str(ours.get("updated_at") or "")
+    their_ts = str(theirs.get("updated_at") or "")
+    if their_ts > our_ts:
+        merged["updated_at"] = their_ts
+    return merged
+
+
+def run_merge_driver(base_path: str, ours_path: str, theirs_path: str) -> int:
+    """Git merge driver entrypoint. Writes the merged result back into `ours_path`."""
+    base = read_yaml(Path(base_path), {})
+    ours = read_yaml(Path(ours_path), {})
+    theirs = read_yaml(Path(theirs_path), {})
+    try:
+        merged = merge_yaml_docs(base, ours, theirs)
+    except Exception:
+        # On any failure, fall back to a conflict so the user resolves by hand
+        # rather than silently losing memory.
+        return 1
+    with Path(ours_path).open("w", encoding="utf-8") as f:
+        yaml.safe_dump(merged, f, allow_unicode=True, sort_keys=False, width=1000)
+    return 0
+
+
+GITATTRIBUTES_CONTENT = """# MemHub: union-merge append-mostly canonical memory lists.
+identity/*.yaml          merge=memhub
+projects/**/*.yaml       merge=memhub
+knowledge/*.yaml         merge=memhub
+relations/*.yaml         merge=memhub
+timeline/*.yaml          merge=memhub
+inbox/*.yaml             merge=memhub
+"""
+
+
+def ensure_merge_driver_registered(repo: Path) -> None:
+    """Register the MemHub merge driver in repo-local git config.
+
+    Local git config is not cloned, so each machine must register the driver
+    once. We do it idempotently on init and at the start of every sync.
+    """
+    existing = run_git(repo, ["config", "--local", "merge.memhub.driver"], check=False)
+    if existing.stdout.strip():
+        return
+    script = Path(__file__).resolve()
+    driver_cmd = f'{json.dumps(sys.executable)} {json.dumps(str(script))} merge-driver %O %A %B'
+    run_git(repo, ["config", "--local", "merge.memhub.name", "MemHub structured YAML merge"], check=False)
+    run_git(repo, ["config", "--local", "merge.memhub.driver", driver_cmd], check=False)
+
+
+def _remote_has_branch(repo: Path, branch: str) -> bool:
+    res = run_git_auth(repo, ["ls-remote", "--heads", "origin", branch], check=False)
+    return bool(res.stdout.strip())
+
+
 def sync_repo(repo: Path) -> str:
     ensure_repo(repo)
+    # Local git config isn't cloned, so register the structured merge driver on
+    # each machine before any pull --rebase might need it. Also backfill
+    # .gitattributes for repos created before merge support existed.
+    ensure_merge_driver_registered(repo)
+    if not (repo / ".gitattributes").exists():
+        write_text(repo / ".gitattributes", GITATTRIBUTES_CONTENT)
     cfg = load_config(repo)
     sync = cfg.get("sync") or {}
     branch = sync.get("branch") or "main"
     remote_names = run_git(repo, ["remote"], check=False).stdout.strip()
-    outputs = []
-    if remote_names:
-        # Commit local changes, pull remote updates, then commit sync state and push everything.
-        commit_all(repo, "memhub: sync local changes")
+    outputs: list[str] = []
+
+    if not remote_names:
+        outputs.append("No git remote configured; local repository only. Run `memhub sync setup github` or `memhub sync setup gitee`.\n")
+        state = read_yaml(repo / ".memhub/state.yaml", {}) or {}
+        state["last_sync_at"] = now_iso()
+        write_yaml(repo / ".memhub/state.yaml", state)
+        commit_all(repo, "memhub: update sync state")
+        return "".join(outputs)
+
+    # Commit local changes first so a pull --rebase has a clean tree to work on.
+    commit_all(repo, "memhub: sync local changes")
+
+    # Only rebase against the remote branch if it actually exists; a brand-new
+    # remote has no branch yet and `pull` would fail noisily.
+    if _remote_has_branch(repo, branch):
         pull = run_git_auth(repo, ["pull", "--rebase", "origin", branch], check=False)
         outputs.append(pull.stdout + pull.stderr)
-        state = read_yaml(repo / ".memhub/state.yaml", {})
-        state["last_sync_at"] = now_iso()
-        write_yaml(repo / ".memhub/state.yaml", state)
-        commit_all(repo, "memhub: update sync state")
-        push = run_git_auth(repo, ["push", "-u", "origin", f"HEAD:{branch}"], check=False)
-        outputs.append(push.stdout + push.stderr)
-    else:
-        outputs.append("No git remote configured; local repository only. Run `memhub sync setup github` or `memhub sync setup gitee`.\n")
-        state = read_yaml(repo / ".memhub/state.yaml", {})
-        state["last_sync_at"] = now_iso()
-        write_yaml(repo / ".memhub/state.yaml", state)
-        commit_all(repo, "memhub: update sync state")
+        if pull.returncode != 0:
+            # Most likely a rebase conflict. Abort to leave the repo in a clean,
+            # usable state rather than stuck mid-rebase, and stop before pushing.
+            if (repo / ".git" / "rebase-merge").exists() or (repo / ".git" / "rebase-apply").exists():
+                run_git(repo, ["rebase", "--abort"], check=False)
+                outputs.append(
+                    "\nMemHub: pull --rebase hit a conflict and was aborted. "
+                    "Local memory is intact and NOT pushed. Resolve manually:\n"
+                    f"  cd {repo} && git pull --rebase origin {branch}\n"
+                    "then re-run `memhub sync`.\n"
+                )
+            else:
+                outputs.append(
+                    "\nMemHub: pull failed (no conflict detected). Local memory is intact and NOT pushed. "
+                    "Check the remote/credentials and re-run `memhub sync`.\n"
+                )
+            return "".join(outputs)
+
+    state = read_yaml(repo / ".memhub/state.yaml", {}) or {}
+    state["last_sync_at"] = now_iso()
+    write_yaml(repo / ".memhub/state.yaml", state)
+    commit_all(repo, "memhub: update sync state")
+    push = run_git_auth(repo, ["push", "-u", "origin", f"HEAD:{branch}"], check=False)
+    outputs.append(push.stdout + push.stderr)
+    if push.returncode != 0:
+        outputs.append(
+            "\nMemHub: push failed. Local memory is committed but not on the remote. "
+            "Check credentials/remote and re-run `memhub sync`.\n"
+        )
     return "".join(outputs)
 
 
@@ -1223,11 +1712,12 @@ def main(argv: list[str] | None = None) -> int:
     p_context.add_argument("--project", default=None)
     p_context.add_argument("--pack", default="standard", choices=["brief", "standard", "full", "project"])
 
-    p_rem = sub.add_parser("remember", help="Write a memory into inbox")
+    p_rem = sub.add_parser("remember", help="Write a memory (default: directly into canonical memory)")
     p_rem.add_argument("content")
     p_rem.add_argument("--type", default="fact")
     p_rem.add_argument("--source", default="manual")
     p_rem.add_argument("--project", default=None)
+    p_rem.add_argument("--inbox", action="store_true", help="Capture into the inbox audit buffer instead of writing canonical memory")
 
     p_inbox = sub.add_parser("inbox", help="Inspect inbox items")
     inbox_sub = p_inbox.add_subparsers(dest="inbox_cmd", required=True)
@@ -1245,6 +1735,19 @@ def main(argv: list[str] | None = None) -> int:
     p_export = sub.add_parser("export", help="Export context")
     p_export.add_argument("target", choices=["chatbot"])
     p_export.add_argument("--project", default=None)
+
+    p_search = sub.add_parser("search", help="Search canonical memory")
+    p_search.add_argument("query")
+    p_search.add_argument("--type", default=None)
+    p_search.add_argument("--project", default=None)
+    p_search.add_argument("--limit", type=int, default=20)
+    p_search.add_argument("--include-archived", action="store_true", help="Also match archived entries")
+
+    p_forget = sub.add_parser("forget", help="Soft-archive matching canonical memory")
+    p_forget.add_argument("query", help="Entry id or content substring")
+    p_forget.add_argument("--type", default=None)
+    p_forget.add_argument("--project", default=None)
+    p_forget.add_argument("--apply", action="store_true", help="Archive matches; default is dry-run preview")
 
     p_sync = sub.add_parser("sync", help="Configure or run GitHub/Gitee sync")
     sync_sub = p_sync.add_subparsers(dest="sync_cmd")
@@ -1268,7 +1771,17 @@ def main(argv: list[str] | None = None) -> int:
     p_sync_setup.add_argument("--broker-url", default=None, help="MemHub OAuth Broker base URL for Gitee one-click OAuth. Or set MEMHUB_GITEE_OAUTH_BROKER_URL")
     sync_sub.add_parser("status", help="Show sync config/status")
 
+    p_merge = sub.add_parser("merge-driver", help=argparse.SUPPRESS)
+    p_merge.add_argument("base")
+    p_merge.add_argument("ours")
+    p_merge.add_argument("theirs")
+
     args = parser.parse_args(argv)
+
+    if args.cmd == "merge-driver":
+        # Invoked by git with temp file paths; no MemHub repo context needed.
+        return run_merge_driver(args.base, args.ours, args.theirs)
+
     repo = Path(args.repo).expanduser().resolve()
 
     if args.cmd == "init":
@@ -1277,8 +1790,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "context":
         print(build_context(repo, project=args.project, pack=args.pack), end="")
     elif args.cmd == "remember":
-        file = remember(repo, args.content, type_=args.type, source_client=args.source, project=args.project)
-        print(f"Wrote inbox item: {file}")
+        print(remember(repo, args.content, type_=args.type, source_client=args.source, project=args.project, to_inbox=args.inbox))
     elif args.cmd == "inbox":
         if args.inbox_cmd == "list":
             print(inbox_list(repo, status=args.status), end="")
@@ -1290,6 +1802,10 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "export":
         out = export_chatbot(repo, project=args.project)
         print(f"Exported chatbot context: {out}")
+    elif args.cmd == "search":
+        print(search(repo, args.query, type_=args.type, project=args.project, limit=args.limit, include_archived=args.include_archived), end="")
+    elif args.cmd == "forget":
+        print(forget(repo, args.query, type_=args.type, project=args.project, apply=args.apply), end="")
     elif args.cmd == "sync":
         if getattr(args, "sync_cmd", None) == "setup":
             print(setup_git_sync(

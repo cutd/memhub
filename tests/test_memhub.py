@@ -72,6 +72,43 @@ class DirectWriteTest(unittest.TestCase):
             self.assertIn("No matching memory", mh.search(repo, "极简"))
             self.assertIn("用户偏好极简", mh.search(repo, "极简", include_archived=True))
 
+    def test_remember_after_forget_revives_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            mh.init_repo(repo, name="tester")
+            mh.remember(repo, "喜欢喝咖啡", type_="preference", source_client="agent")
+            mh.forget(repo, "咖啡", apply=True)
+            self.assertIn("No matching memory", mh.search(repo, "咖啡"))
+            # Re-remembering the same content must bring it back, not be dropped.
+            out = mh.remember(repo, "喜欢喝咖啡", type_="preference", source_client="agent")
+            self.assertNotIn("skipped", out)
+            self.assertIn("喜欢喝咖啡", mh.search(repo, "咖啡"))
+            # And it should not have created a second copy.
+            prefs = mh.read_yaml(repo / "identity/preferences.yaml", {})["preferences"]
+            same = [p for p in prefs if p.get("content") == "喜欢喝咖啡"]
+            self.assertEqual(len(same), 1)
+            self.assertEqual(same[0].get("status"), "active")
+
+    def test_forgotten_timeline_event_leaves_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            mh.init_repo(repo, name="tester")
+            mh.remember(repo, "发生了X事件", type_="event", source_client="agent")
+            self.assertIn("发生了X事件", mh.build_context(repo, pack="full"))
+            mh.forget(repo, "X事件", apply=True)
+            self.assertNotIn("发生了X事件", mh.build_context(repo, pack="full"))
+
+    def test_search_query_does_not_match_type_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            mh.init_repo(repo, name="tester")
+            # A preference whose content does NOT contain the word "preference".
+            mh.remember(repo, "深色主题", type_="preference", source_client="agent")
+            # Searching the type name must not surface content lacking that word.
+            self.assertNotIn("深色主题", mh.search(repo, "preference"))
+            # The real --type filter still works.
+            self.assertIn("深色主题", mh.search(repo, "深色", type_="preference"))
+
 
 class MergeDriverTest(unittest.TestCase):
     def test_union_merge_resolves_divergent_appends(self) -> None:

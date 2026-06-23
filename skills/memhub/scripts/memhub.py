@@ -311,7 +311,11 @@ def latest_timeline_events(repo: Path, limit: int) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for path in sorted((repo / "timeline").glob("*.yaml"), reverse=True):
         data = read_yaml(path, {}) or {}
-        events.extend(data.get("events", []) or [])
+        for ev in data.get("events", []) or []:
+            # Archived events were `forget`-ten; keep them out of context.
+            if isinstance(ev, dict) and ev.get("status", "active") != "active":
+                continue
+            events.append(ev)
         if len(events) >= limit:
             break
     events.sort(key=lambda e: str(e.get("date") or e.get("created_at") or ""), reverse=True)
@@ -594,7 +598,7 @@ def search(repo: Path, query: str, type_: str | None = None, project: str | None
         if project and _entry_project(repo, path) != project:
             continue
         label = _entry_label(entry)
-        if q and q not in _normalize_content(label) and q not in _normalize_content(entry.get("type")):
+        if q and q not in _normalize_content(label):
             continue
         rel = path.relative_to(repo).as_posix()
         matches.append((float(entry.get("importance", 0) or 0), rel, entry))
@@ -646,6 +650,8 @@ def forget(repo: Path, query: str, type_: str | None = None, project: str | None
 
     if not apply:
         lines.append(f"Dry run only. {total} entr{'y' if total == 1 else 'ies'} would be archived. Re-run with --apply.")
+        if total > 1:
+            lines.append("Multiple matches — narrow with a longer query, an exact id, or --type/--project if some should be kept.")
         return "\n".join(lines) + "\n"
 
     for path in hits:
@@ -784,11 +790,24 @@ def _normalize_content(value: Any) -> str:
 
 
 def append_unique(container: dict[str, Any], key: str, entry: dict[str, Any]) -> bool:
+    """Insert entry unless an active duplicate exists. If the only match is an
+    archived entry, revive it (status -> active) so re-remembering a forgotten
+    memory brings it back instead of being silently dropped as a duplicate."""
     items = container.setdefault(key, [])
     content = _normalize_content(entry.get("content"))
-    for existing in items:
-        if content and _normalize_content(existing.get("content")) == content:
-            return False
+    if content:
+        archived_match: dict[str, Any] | None = None
+        for existing in items:
+            if _normalize_content(existing.get("content")) != content:
+                continue
+            if existing.get("status", "active") == "active":
+                return False  # live duplicate; nothing to do
+            archived_match = archived_match or existing
+        if archived_match is not None:
+            archived_match["status"] = "active"
+            archived_match.pop("archived_at", None)
+            container["updated_at"] = now_iso()
+            return True
     items.insert(0, entry)
     container["updated_at"] = now_iso()
     return True
@@ -1617,16 +1636,18 @@ inbox/*.yaml             merge=memhub
 
 
 def ensure_merge_driver_registered(repo: Path) -> None:
-    """Register the MemHub merge driver in repo-local git config.
+    """Register (or refresh) the MemHub merge driver in repo-local git config.
 
     Local git config is not cloned, so each machine must register the driver
-    once. We do it idempotently on init and at the start of every sync.
+    once. The command embeds an absolute interpreter + script path, which can go
+    stale if the skill package moves; we therefore refresh the entry whenever the
+    current path differs from what is registered. Idempotent on init and sync.
     """
-    existing = run_git(repo, ["config", "--local", "merge.memhub.driver"], check=False)
-    if existing.stdout.strip():
-        return
     script = Path(__file__).resolve()
     driver_cmd = f'{json.dumps(sys.executable)} {json.dumps(str(script))} merge-driver %O %A %B'
+    existing = run_git(repo, ["config", "--local", "merge.memhub.driver"], check=False).stdout.strip()
+    if existing == driver_cmd:
+        return
     run_git(repo, ["config", "--local", "merge.memhub.name", "MemHub structured YAML merge"], check=False)
     run_git(repo, ["config", "--local", "merge.memhub.driver", driver_cmd], check=False)
 

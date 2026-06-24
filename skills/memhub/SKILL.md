@@ -1,6 +1,6 @@
 ---
 name: memhub
-version: 0.3.0
+version: 0.4.0
 description: 使用 MemHub Protocol v0.1 读写用户的跨 Agent 统一记忆仓库。当用户要求记住信息、检索/遗忘记忆、读取个人/项目上下文、生成 chatbot 注入文本、同步 Git 记忆仓库时使用。
 tags:
   - memory
@@ -100,6 +100,9 @@ python scripts/memhub.py --repo ~/memhub-data sync setup github --auth token --r
 python scripts/memhub.py --repo ~/memhub-data sync setup github --auth ssh --remote-method ssh --owner <login> --repo-name mymemhub --no-create
 python scripts/memhub.py --repo ~/memhub-data sync status
 python scripts/memhub.py --repo ~/memhub-data sync
+
+# 自检：确认本机/本仓库的自动同步是否就绪（remote/token/merge driver/MEMHUB_REPO 等）
+python scripts/memhub.py --repo ~/memhub-data doctor
 ```
 
 ## Agent 行为协议
@@ -182,6 +185,10 @@ python scripts/memhub.py --repo "$MEMHUB_REPO" sync
 
 `init`/`sync` 会自动注册结构化 merge 驱动（local git config 不随 clone 走，故每台设备首次
 `sync` 会自愈补注册），多设备对同一记忆文件的并发追加可自动合并，不会冲突。
+
+> **换新机器/新 Agent 时**：凭据（token）存在本机 `.memhub/secrets.yaml` 且不随 git 同步，
+> 所以新机器即使 clone 了记忆仓库也需要**重新授权一次**。先跑 `doctor` 自检，按提示补齐
+> remote/token 即可——全绿后自动同步即就绪。
 
 ### 检索与遗忘
 

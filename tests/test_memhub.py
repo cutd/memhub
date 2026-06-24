@@ -223,5 +223,35 @@ class AutoSyncTest(unittest.TestCase):
             self.assertIn("A写的可记事件", mh.build_context(repo_b, pack="full"))
 
 
+class DoctorTest(unittest.TestCase):
+    def test_doctor_flags_missing_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            mh.init_repo(repo, name="A")
+            report = mh.doctor(repo)
+            self.assertIn("remote", report)
+            self.assertIn("NOT ready", report)
+
+    def test_doctor_ready_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo, bare = base / "repo", base / "bare.git"
+            mh.init_repo(repo, name="A")
+            subprocess.run(["git", "init", "--bare", str(bare)], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=repo, check=True)
+            cfg = mh.load_config(repo)
+            cfg["sync"].update({"remote": str(bare), "provider": "github", "auth_method": "token"})
+            mh.save_config(repo, cfg)
+            import os
+            os.environ["MEMHUB_GITHUB_TOKEN"] = "faketoken"
+            try:
+                report = mh.doctor(repo)
+            finally:
+                os.environ.pop("MEMHUB_GITHUB_TOKEN", None)
+            self.assertIn("github token available", report)
+            self.assertNotIn("NOT ready", report)
+
+
 if __name__ == "__main__":
     unittest.main()

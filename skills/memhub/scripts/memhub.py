@@ -1497,7 +1497,116 @@ def sync_status(repo: Path) -> str:
     lines.append(run_git(repo, ["status", "--short", "--branch"], check=False).stdout.strip())
     return "\n".join(lines).strip() + "\n"
 
-def _render_simple_template(tpl: str, values: dict[str, str]) -> str:
+
+def _fmt_ago(iso_ts: str | None) -> str:
+    secs = _seconds_since(iso_ts)
+    if secs == float("inf"):
+        return "never"
+    secs = int(secs)
+    if secs < 90:
+        return f"{secs}s ago"
+    if secs < 5400:
+        return f"{secs // 60}m ago"
+    if secs < 172800:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+def doctor(repo: Path) -> str:
+    """Diagnose whether automatic memory sync is ready on this machine/repo.
+
+    Checks each precondition maybe_auto_push/maybe_auto_pull rely on and prints
+    OK / WARN / FAIL with a fix hint, so a fresh agent or new machine can tell at
+    a glance what (if anything) still needs doing."""
+    checks: list[tuple[str, str, str]] = []  # (status, label, detail)
+
+    def add(ok: str, label: str, detail: str = "") -> None:
+        checks.append((ok, label, detail))
+
+    # 1. Repo path / MEMHUB_REPO
+    env_repo = os.environ.get("MEMHUB_REPO")
+    if env_repo:
+        same = Path(env_repo).expanduser().resolve() == repo
+        add("OK" if same else "WARN", "MEMHUB_REPO",
+            f"= {repo}" if same else f"env={env_repo} but operating on {repo}; agents must share one path")
+    else:
+        add("WARN", "MEMHUB_REPO",
+            f"unset; using {repo}. Set MEMHUB_REPO so every agent points at the same repo")
+
+    # 2. Git repository present
+    is_git = (repo / ".git").exists()
+    add("OK" if is_git else "FAIL", "git repo",
+        str(repo) if is_git else f"not a git repo; run `memhub --repo {repo} init`")
+    if not is_git:
+        return _render_doctor(checks)
+
+    cfg = load_config(repo)
+    sync = cfg.get("sync") or {}
+    provider = sync.get("provider")
+    branch = sync.get("branch") or "main"
+
+    # 3. Remote configured
+    remote = sync.get("remote") or run_git(repo, ["remote", "get-url", "origin"], check=False).stdout.strip()
+    add("OK" if remote else "FAIL", "remote",
+        remote if remote else "no remote; run `memhub sync setup github` (or gitee)")
+
+    # 4. Credential (token) reachable on THIS machine
+    if provider in PROVIDERS and sync.get("auth_method") in {"token", "oauth"}:
+        tok = get_token(repo, provider, require=False)
+        add("OK" if tok else "FAIL", "credential",
+            f"{provider} token available" if tok
+            else f"no {provider} token on this machine; re-run `memhub sync setup {provider}` "
+                 f"or set {PROVIDERS[provider]['env_token']}")
+    elif sync.get("auth_method") == "ssh":
+        add("OK", "credential", "ssh (no token stored by MemHub)")
+    elif remote:
+        add("WARN", "credential", "auth method unknown; sync may prompt for credentials")
+
+    # 5. Merge driver registered (per-machine, not cloned)
+    driver = run_git(repo, ["config", "--local", "merge.memhub.driver"], check=False).stdout.strip()
+    add("OK" if driver else "WARN", "merge driver",
+        "registered" if driver else "not registered yet; runs automatically on next `sync`")
+
+    # 6. Auto flags
+    add("OK" if sync.get("auto_push", True) else "WARN", "auto_push",
+        "on" if sync.get("auto_push", True) else "off; writes won't push until manual sync")
+    add("OK" if sync.get("auto_pull", True) else "WARN", "auto_pull",
+        "on" if sync.get("auto_pull", True) else "off; context won't pull automatically")
+
+    # 7. Throttle config
+    add("OK", "throttle",
+        f"push {sync.get('push_throttle_seconds', 3600)}s / pull {sync.get('pull_throttle_seconds', 3600)}s")
+
+    # 8. Last sync activity (per-machine cache)
+    cache = _read_sync_cache(repo)
+    add("OK", "last push", _fmt_ago(cache.get("last_push_at")))
+    add("OK", "last pull", _fmt_ago(cache.get("last_pull_at")))
+
+    # 9. Uncommitted local changes
+    dirty = run_git(repo, ["status", "--porcelain"], check=False).stdout.strip()
+    add("OK" if not dirty else "WARN", "working tree",
+        "clean" if not dirty else "uncommitted changes present (will be committed on next write/sync)")
+
+    return _render_doctor(checks)
+
+
+def _render_doctor(checks: list[tuple[str, str, str]]) -> str:
+    icon = {"OK": "✓", "WARN": "!", "FAIL": "✗"}
+    width = max((len(label) for _, label, _ in checks), default=0)
+    lines = ["MemHub doctor — automatic sync readiness:"]
+    for status, label, detail in checks:
+        lines.append(f"  [{icon.get(status, '?')}] {label.ljust(width)}  {detail}".rstrip())
+    fails = sum(1 for s, _, _ in checks if s == "FAIL")
+    warns = sum(1 for s, _, _ in checks if s == "WARN")
+    if fails:
+        lines.append(f"\n{fails} blocker(s): automatic sync is NOT ready. Fix the ✗ items above.")
+    elif warns:
+        lines.append(f"\nReady with {warns} note(s). Auto-sync works; review the ! items.")
+    else:
+        lines.append("\nAll good — memory syncs automatically on this machine.")
+    return "\n".join(lines) + "\n"
+
+
     """Render a minimal `{{ key }}` template with stdlib only.
 
     Intentionally tiny: supports `{{ name }}` substitution with optional inner
@@ -1884,6 +1993,8 @@ def main(argv: list[str] | None = None) -> int:
     p_sync_setup.add_argument("--broker-url", default=None, help="MemHub OAuth Broker base URL for Gitee one-click OAuth. Or set MEMHUB_GITEE_OAUTH_BROKER_URL")
     sync_sub.add_parser("status", help="Show sync config/status")
 
+    sub.add_parser("doctor", help="Diagnose whether automatic memory sync is ready")
+
     p_merge = sub.add_parser("merge-driver", help=argparse.SUPPRESS)
     p_merge.add_argument("base")
     p_merge.add_argument("ours")
@@ -1960,6 +2071,8 @@ def main(argv: list[str] | None = None) -> int:
             print(sync_status(repo), end="")
         else:
             print(sync_repo(repo), end="")
+    elif args.cmd == "doctor":
+        print(doctor(repo), end="")
     return 0
 
 

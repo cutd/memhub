@@ -333,6 +333,12 @@ throttle timestamps live in `.memhub/cache/sync.yaml`, which is **git-ignored an
 per-machine** — sync cadence is a local concern and committing it would create
 cross-device merge churn. An explicit `sync` always ignores the throttle.
 
+Because credentials and the merge-driver registration are per-machine (not
+cloned), a fresh machine that clones the memory repo still needs to authorize
+once. Implementations SHOULD offer a readiness check (the reference CLI's
+`doctor` command) that reports remote, credential, merge-driver, `MEMHUB_REPO`,
+and last-sync state with fix hints.
+
 ### 8.1 Structured merge driver
 
 Canonical files are append-mostly YAML lists, so two devices that each append

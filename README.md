@@ -24,6 +24,7 @@ python -m memhub_cli search --repo ./my-memhub "关键词"
 python -m memhub_cli forget --repo ./my-memhub "关键词" --apply       # 软归档
 python -m memhub_cli export chatbot --repo ./my-memhub
 python -m memhub_cli sync --repo ./my-memhub
+python -m memhub_cli doctor --repo ./my-memhub      # 自检自动同步是否就绪
 ```
 
 `remember` 默认直接写入 canonical 记忆并本地提交。配置 remote 后，写入会自动推送、

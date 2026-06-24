@@ -1,6 +1,6 @@
 ---
 name: memhub
-version: 0.4.0
+version: 0.4.1
 description: 使用 MemHub Protocol v0.1 读写用户的跨 Agent 统一记忆仓库。当用户要求记住信息、检索/遗忘记忆、读取个人/项目上下文、生成 chatbot 注入文本、同步 Git 记忆仓库时使用。
 tags:
   - memory
@@ -128,8 +128,19 @@ python scripts/memhub.py --repo ~/memhub-data doctor
 
 ### 对话开始：读取上下文
 
-如果当前任务需要用户长期偏好、项目上下文或跨设备最新记忆，直接读取 context 即可——
-`context` 会按节流阈值**自动从远端拉取**最新记忆，通常无需先手动 `sync`：
+**本会话首次涉及记忆时**，先跑一次自检确认自动同步就绪（每个会话只需一次，不要每轮都跑）：
+
+```bash
+python scripts/memhub.py --repo "$MEMHUB_REPO" doctor
+```
+
+- 若 doctor 报 `NOT ready`（有 ✗），说明自动同步未生效。按提示补齐：缺 remote → 提示用户
+  `sync setup`；缺 token（常见于新机器）→ 引导用户重新授权；其余 ✗ 同理。**不要静默忽略**，
+  否则用户会误以为在自动同步，实际没有。
+- 若全绿或只有 `!` 提示，继续正常流程。
+- doctor 是只读的、不联网，开销很小；但仍只需每会话首次跑一次即可。
+
+确认就绪后，直接读取 context——`context` 会按节流阈值**自动从远端拉取**最新记忆，通常无需先手动 `sync`：
 
 ```bash
 python scripts/memhub.py --repo "$MEMHUB_REPO" context --pack brief

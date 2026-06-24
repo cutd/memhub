@@ -366,9 +366,15 @@ this idempotently on `init` and at the start of every `sync`.
 
 Three auth methods:
 
-- **oauth** (default) — GitHub Device Flow (embedded public client id) or Gitee
-  Authorization Code via a MemHub OAuth Broker (client_secret stays server-side)
-  or developer direct mode. Tokens stored in `.memhub/secrets.yaml`.
+- **oauth** (default) — both GitHub and Gitee default to a shared **MemHub Auth
+  Broker** (v2 session flow) that keeps each provider's OAuth client_secret
+  server-side, so setup needs no per-user configuration. The flow is:
+  `POST {broker}/auth/session?provider=<p>` → open the returned `auth_url` →
+  poll `GET {broker}/auth/session/{id}` until a token is issued. Broker URL
+  precedence: `--broker-url` → provider env (`MEMHUB_GITEE_OAUTH_BROKER_URL`) →
+  generic env (`MEMHUB_OAUTH_BROKER_URL`) → built-in default. Developer direct
+  mode (GitHub Device Flow, or Gitee with an explicit `--client-secret`) remains
+  available as a fallback. Tokens stored in `.memhub/secrets.yaml`.
 - **token** — personal access token, stored in `.memhub/secrets.yaml`.
 - **ssh** — SSH remote; MemHub stores no credential.
 

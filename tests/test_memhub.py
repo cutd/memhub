@@ -272,5 +272,28 @@ class DoctorTest(unittest.TestCase):
             self.assertNotIn("NOT ready", report)
 
 
+class BrokerTest(unittest.TestCase):
+    def test_broker_url_precedence(self) -> None:
+        import os
+        # built-in default
+        self.assertEqual(mh.resolve_broker_url("gitee"), "https://oauth.1024hub.cn")
+        self.assertEqual(mh.resolve_broker_url("github"), "https://oauth.1024hub.cn")
+        # explicit arg wins over everything
+        self.assertEqual(mh.resolve_broker_url("gitee", "https://custom.example"), "https://custom.example")
+        # provider env overrides default
+        os.environ["MEMHUB_GITEE_OAUTH_BROKER_URL"] = "https://env.example"
+        try:
+            self.assertEqual(mh.resolve_broker_url("gitee"), "https://env.example")
+        finally:
+            os.environ.pop("MEMHUB_GITEE_OAUTH_BROKER_URL", None)
+
+    def test_extract_broker_token_tolerates_field_names(self) -> None:
+        self.assertEqual(mh._extract_broker_token({"access_token": "a"}), "a")
+        self.assertEqual(mh._extract_broker_token({"token": "b"}), "b")
+        self.assertEqual(mh._extract_broker_token({"accessToken": "c"}), "c")
+        self.assertEqual(mh._extract_broker_token({"data": {"access_token": "d"}}), "d")
+        self.assertIsNone(mh._extract_broker_token({"status": "pending"}))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -927,6 +927,8 @@ PROVIDERS: dict[str, dict[str, str]] = {
         "oauth_access_token_url": "https://github.com/login/oauth/access_token",
         "env_client_id": "MEMHUB_GITHUB_CLIENT_ID",
         "default_client_id": 'Ov23livelceFZGWGJG0A',
+        "env_broker_url": "MEMHUB_OAUTH_BROKER_URL",
+        "default_broker_url": "https://oauth.1024hub.cn",
     },
     "gitee": {
         "display": "Gitee",
@@ -941,8 +943,15 @@ PROVIDERS: dict[str, dict[str, str]] = {
         "default_client_id": '857230fab7f3c4cf4439383f1afc236f4f3ec2435fb114e149c0cfc288e589f8',
         "env_client_secret": "MEMHUB_GITEE_CLIENT_SECRET",
         "env_broker_url": "MEMHUB_GITEE_OAUTH_BROKER_URL",
+        "default_broker_url": "https://oauth.1024hub.cn",
     },
 }
+
+
+# Shared MemHub Auth Broker (v2 session protocol). The broker holds each
+# provider's OAuth client_secret server-side, so the skill works out of the box
+# with no per-user setup. Override per provider via env_broker_url or --broker-url.
+DEFAULT_BROKER_URL = "https://oauth.1024hub.cn"
 
 
 def config_path(repo: Path) -> Path:
@@ -1295,7 +1304,11 @@ def gitee_oauth_flow(client_id: str, client_secret: str, redirect_uri: str, scop
 
 
 def gitee_broker_oauth_flow(broker_url: str, redirect_uri: str, scope: str = "user_info projects", no_browser: bool = False, callback_port: int = 8765, manual_code: str | None = None) -> str:
-    """Gitee OAuth via MemHub OAuth Broker.
+    """DEPRECATED legacy broker protocol (broker < 2.0 with /oauth/gitee/*
+    endpoints). Superseded by broker_session_flow() for the v2 session API.
+    Kept for reference / old self-hosted brokers; not called by default.
+
+    Gitee OAuth via MemHub OAuth Broker.
 
     Broker protocol:
     - GET  {broker}/oauth/gitee/authorize?redirect_uri=...&scope=...&state=...
@@ -1334,6 +1347,89 @@ def gitee_broker_oauth_flow(broker_url: str, redirect_uri: str, scope: str = "us
     return str(body["access_token"])
 
 
+def resolve_broker_url(provider: str, broker_url: str | None = None) -> str | None:
+    """Broker URL precedence: explicit arg -> provider env -> generic env ->
+    built-in default."""
+    meta = PROVIDERS.get(provider, {})
+    return (
+        broker_url
+        or os.environ.get(meta.get("env_broker_url", ""))
+        or os.environ.get("MEMHUB_OAUTH_BROKER_URL", "")
+        or meta.get("default_broker_url")
+        or DEFAULT_BROKER_URL
+        or None
+    )
+
+
+def _http_get_json(url: str) -> tuple[int, dict[str, Any] | str]:
+    req = urllib.request.Request(url, method="GET", headers={"Accept": "application/json", "User-Agent": "MemHub/0.1"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+            try:
+                return resp.status, json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                return resp.status, raw
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            return exc.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return exc.code, raw
+
+
+def _extract_broker_token(body: dict[str, Any]) -> str | None:
+    """Pull an access token out of a broker session-status payload, tolerating
+    several field names so a minor broker schema change doesn't break us."""
+    for key in ("access_token", "token", "accessToken"):
+        if body.get(key):
+            return str(body[key])
+    for outer in ("token", "data", "result", "credential"):
+        inner = body.get(outer)
+        if isinstance(inner, dict):
+            for key in ("access_token", "token", "accessToken"):
+                if inner.get(key):
+                    return str(inner[key])
+    return None
+
+
+def broker_session_flow(broker_url: str, provider: str, no_browser: bool = False, poll_timeout: int = 300) -> str:
+    """MemHub Auth Broker v2 session flow.
+
+    1. POST {broker}/auth/session?provider=<p>  -> { session_id, auth_url, expires_in }
+    2. Open auth_url; the user approves at the provider. The broker holds the
+       client_secret and handles the callback.
+    3. Poll GET {broker}/auth/session/{session_id} until a token is issued
+       (status leaves "pending"). Returns the access token.
+    """
+    broker = broker_url.rstrip("/")
+    status, body = json_post(f"{broker}/auth/session?provider={urllib.parse.quote(provider)}", {"provider": provider})
+    if status >= 400 or not isinstance(body, dict) or not body.get("session_id"):
+        raise SystemExit(f"Broker session create failed: HTTP {status}: {body}")
+    session_id = str(body["session_id"])
+    auth_url = body.get("auth_url") or f"{broker}/auth/start?session_id={session_id}"
+    expires_in = int(body.get("expires_in") or poll_timeout)
+
+    print(f"{PROVIDERS[provider]['display']} 授权：在浏览器中完成授权即可。", file=sys.stderr)
+    open_or_print_url(str(auth_url), no_browser=no_browser)
+
+    waited = 0
+    interval = 3
+    while waited < expires_in:
+        time.sleep(interval)
+        waited += interval
+        st, sbody = _http_get_json(f"{broker}/auth/session/{urllib.parse.quote(session_id)}")
+        if st >= 400 or not isinstance(sbody, dict):
+            continue
+        token = _extract_broker_token(sbody)
+        if token:
+            return token
+        state = str(sbody.get("status", "")).lower()
+        if state in {"error", "failed", "denied", "expired"}:
+            raise SystemExit(f"Broker authorization failed: {sbody}")
+    raise SystemExit("Broker authorization timed out before a token was issued. Re-run sync setup.")
+
+
 def oauth_token(
     provider: str,
     client_id: str | None = None,
@@ -1346,31 +1442,33 @@ def oauth_token(
     broker_url: str | None = None,
 ) -> str:
     meta = PROVIDERS[provider]
+
+    # Default path: the shared MemHub Auth Broker (v2 session flow). It keeps
+    # each provider's client_secret server-side, so this works out of the box
+    # for both GitHub and Gitee with no per-user configuration. A developer can
+    # still opt into a direct flow by passing --client-secret (Gitee) or by
+    # explicitly disabling the broker via --broker-url "" .
+    explicit_secret = client_secret or os.environ.get(meta.get("env_client_secret", ""))
+    if not explicit_secret:
+        broker = resolve_broker_url(provider, broker_url)
+        if broker:
+            return broker_session_flow(broker, provider, no_browser=no_browser)
+
+    # --- Fallbacks (no broker, or developer direct mode) ---------------------
     client_id = client_id or os.environ.get(meta.get("env_client_id", "")) or meta.get("default_client_id")
     if not client_id:
         raise SystemExit(f"Missing {meta['display']} OAuth client id. Pass --client-id or set {meta.get('env_client_id', '')}.")
     if provider == "github":
         return github_device_flow(client_id, scope=scope or "repo", no_browser=no_browser)
-    broker_url = broker_url or os.environ.get(meta.get("env_broker_url", ""))
-    client_secret = client_secret or os.environ.get(meta.get("env_client_secret", ""))
-    if provider == "gitee" and broker_url and not client_secret:
-        return gitee_broker_oauth_flow(
-            broker_url,
-            redirect_uri=redirect_uri or f"http://127.0.0.1:{callback_port}/callback",
-            scope=scope or "user_info projects",
-            no_browser=no_browser,
-            callback_port=callback_port,
-            manual_code=manual_code,
-        )
-    if not client_secret:
+    if not explicit_secret:
         raise SystemExit(
-            "Gitee one-click OAuth requires a MemHub OAuth Broker. Set MEMHUB_GITEE_OAUTH_BROKER_URL, "
-            "or use developer direct mode with --client-secret / MEMHUB_GITEE_CLIENT_SECRET. "
+            "Gitee OAuth needs either the MemHub Auth Broker (default) or developer "
+            "direct mode with --client-secret / MEMHUB_GITEE_CLIENT_SECRET. "
             "Do not embed Gitee client_secret in public code."
         )
     return gitee_oauth_flow(
         client_id,
-        client_secret,
+        explicit_secret,
         redirect_uri=redirect_uri or f"http://127.0.0.1:{callback_port}/callback",
         scope=scope or "user_info projects",
         no_browser=no_browser,
@@ -1398,6 +1496,7 @@ def setup_git_sync(
     manual_code: str | None = None,
     broker_url: str | None = None,
 ) -> str:
+    repo.mkdir(parents=True, exist_ok=True)
     ensure_repo(repo)
     if provider not in PROVIDERS:
         raise SystemExit(f"Unsupported provider: {provider}. Choose: {', '.join(PROVIDERS)}")
@@ -1561,6 +1660,21 @@ def doctor(repo: Path) -> str:
         add("OK", "credential", "ssh (no token stored by MemHub)")
     elif remote:
         add("WARN", "credential", "auth method unknown; sync may prompt for credentials")
+
+    # 4b. OAuth broker reachability (only relevant for oauth auth without a token yet)
+    if sync.get("auth_method") == "oauth" or (provider in PROVIDERS and not sync.get("auth_method")):
+        broker = resolve_broker_url(provider or "gitee")
+        if broker:
+            st, body = _http_get_json(f"{broker.rstrip('/')}/auth/providers")
+            if st == 200 and isinstance(body, dict) and provider in (body.get("providers") or []):
+                add("OK", "oauth broker", f"{broker} (supports {provider})")
+            elif st == 200 and isinstance(body, dict):
+                add("WARN", "oauth broker",
+                    f"{broker} reachable but provider '{provider}' not in {body.get('providers')}")
+            else:
+                add("WARN", "oauth broker", f"{broker} not reachable (HTTP {st}); OAuth setup may fail")
+        else:
+            add("WARN", "oauth broker", "no broker configured; Gitee one-click OAuth unavailable")
 
     # 5. Merge driver registered (per-machine, not cloned)
     driver = run_git(repo, ["config", "--local", "merge.memhub.driver"], check=False).stdout.strip()

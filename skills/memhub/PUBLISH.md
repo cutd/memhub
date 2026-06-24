@@ -4,10 +4,10 @@
 
 - Slug: `memhub`
 - Display name: `MemHub`
-- Version: `0.4.1`
+- Version: `0.4.2`
 - Tags: `memory`, `memhub`, `github`, `gitee`, `sync`, `agent-memory`
-- Summary: `跨 Agent 统一记忆仓库 Skill：直写/检索/遗忘记忆，按小时节流的自动 Git 同步（GitHub/Gitee OAuth），doctor 自检，多设备结构化合并。`
-- Changelog: `remember 默认直写 canonical（--inbox 转为可选审计缓冲）；新增 search/forget/doctor 命令；写入即自动推送、context 自动拉取（小时级节流，可配置），装了 skill 的 Agent 无需手动 sync；新增结构化 merge 驱动，多设备并发追加自动合并不冲突；修复 forget 后重记丢失、归档过滤、push 失败节流等问题。`
+- Summary: `跨 Agent 统一记忆仓库 Skill：直写/检索/遗忘记忆，按小时节流的自动 Git 同步，GitHub/Gitee OAuth 开箱即用（内置 Auth Broker），doctor 自检，多设备结构化合并。`
+- Changelog: `GitHub/Gitee OAuth 统一走内置 MemHub Auth Broker（v2 session 协议），开箱即用、无需任何环境变量；doctor 增加 broker 就绪检查；保留 token/SSH/直连 fallback。`
 
 ## 包内容
 

@@ -31,47 +31,39 @@ python scripts/memhub.py --repo "$MEMHUB_REPO" init --name dateng --role "Produc
 
 ## 配置 GitHub/Gitee 同步
 
-推荐使用 OAuth setup 命令，而不是手动配置 remote。
+推荐使用 OAuth setup 命令，而不是手动配置 remote。**GitHub 和 Gitee 都开箱即用**：
+两者默认都走内置的 MemHub Auth Broker（`https://oauth.1024hub.cn`），它在服务端保管各
+provider 的 OAuth `client_secret`，普通用户无需配置任何环境变量或自建 OAuth 应用。
 
-### GitHub Device Flow
-
-MemHub 已内置 GitHub OAuth App client id。普通用户不需要配置 GitHub client id，只需要在 GitHub 授权页面确认权限：
+### GitHub / Gitee 一键授权（默认走 broker）
 
 ```bash
 python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup github --repo-name mymemhub
+python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup gitee  --repo-name mymemhub
 ```
 
-开发者如需覆盖内置 OAuth App，可通过环境变量、home 目录 `.env`、当前目录 `.env` 或 `--client-id` 传入：
+流程（两者一致）：
+
+1. CLI 调 broker 创建授权 session，拿到 `auth_url`；
+2. CLI 打开该 URL，用户在 GitHub/Gitee 页面点击确认授权；
+3. broker 在服务端用 `client_secret` 换取 token；
+4. CLI 轮询 broker 拿到 token，存入本地 `.memhub/secrets.yaml`（git 忽略）。
+
+无浏览器环境加 `--no-browser`，CLI 会打印 URL 供手动打开。
+
+### 高级覆盖 / Fallback
 
 ```bash
+# 自建 broker
+export MEMHUB_OAUTH_BROKER_URL=https://<your-broker-host>
+# 覆盖内置 OAuth App client id
 export MEMHUB_GITHUB_CLIENT_ID=<github-oauth-app-client-id>
-python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup github --repo-name mymemhub
-```
-
-### Gitee 一键授权 / Authorization Code
-
-Gitee 要做到普通用户“只点确认授权”，不能把 `client_secret` 写进 Skill。正确路径是 MemHub OAuth Broker：
-
-1. CLI 打开 MemHub Broker 的 Gitee 授权页；
-2. 用户在 Gitee 页面点击确认授权；
-3. Broker 在服务端使用 Gitee `client_secret` 换取 token；
-4. CLI 只接收最终 token 并存入本地 `.memhub/secrets.yaml`。
-
-客户端使用方式：
-
-```bash
-export MEMHUB_GITEE_OAUTH_BROKER_URL=https://<your-broker-host>
-python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup gitee --repo-name mymemhub
-```
-
-开发者直连模式仍可使用 `client_secret`，但不要把 secret 提交到仓库或发布包：
-
-```bash
+export MEMHUB_GITEE_CLIENT_ID=<gitee-oauth-app-client-id>
+# 开发者直连（不经 broker，自己保管 Gitee secret，勿提交到仓库）
 export MEMHUB_GITEE_CLIENT_SECRET=<gitee-oauth-app-client-secret>
-python scripts/memhub.py --repo "$MEMHUB_REPO" sync setup gitee --repo-name mymemhub
 ```
 
-### Fallback
+### Token / SSH Fallback
 
 ```bash
 # Token fallback

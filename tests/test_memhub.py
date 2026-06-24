@@ -155,5 +155,73 @@ class MergeDriverTest(unittest.TestCase):
             self.assertIn("B的偏好", result)
 
 
+class AutoSyncTest(unittest.TestCase):
+    def _wire_remote(self, base: Path) -> tuple[Path, Path, Path]:
+        repo_a, bare, repo_b = base / "a", base / "bare.git", base / "b"
+        mh.init_repo(repo_a, name="A")
+        subprocess.run(["git", "init", "--bare", str(bare)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=repo_a, check=True)
+        # Reflect the remote in config so auto_* helpers see it.
+        self._set_sync(repo_a, remote=str(bare))
+        return repo_a, bare, repo_b
+
+    def _set_sync(self, repo: Path, **fields) -> None:
+        cfg = mh.load_config(repo)
+        cfg.setdefault("sync", {}).update(fields)
+        mh.save_config(repo, cfg)
+
+    def test_throttle_zero_pushes_on_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_a, bare, _ = self._wire_remote(Path(tmp))
+            self._set_sync(repo_a, push_throttle_seconds=0, pull_throttle_seconds=0)
+            mh.sync_repo(repo_a)  # establish the remote branch
+            mh.remember(repo_a, "立即上远端", type_="preference", source_client="A")
+            mh.maybe_auto_push(repo_a)
+            log = subprocess.run(["git", "log", "--oneline", "main"], cwd=bare,
+                                 text=True, capture_output=True).stdout
+            self.assertIn("立即上远端", log)
+
+    def test_throttle_window_keeps_write_local(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_a, bare, _ = self._wire_remote(Path(tmp))
+            self._set_sync(repo_a, push_throttle_seconds=0, pull_throttle_seconds=0)
+            mh.sync_repo(repo_a)
+            # Now widen the window; a fresh push just happened, so the next write
+            # must stay local.
+            self._set_sync(repo_a, push_throttle_seconds=99999)
+            mh.remember(repo_a, "窗口内不推", type_="fact", source_client="A")
+            pushed = mh.maybe_auto_push(repo_a)
+            self.assertEqual(pushed, "")  # throttled
+            remote_log = subprocess.run(["git", "log", "--oneline", "main"], cwd=bare,
+                                        text=True, capture_output=True).stdout
+            self.assertNotIn("窗口内不推", remote_log)
+            # But it IS committed locally — memory is never lost.
+            local_log = subprocess.run(["git", "log", "--oneline"], cwd=repo_a,
+                                       text=True, capture_output=True).stdout
+            self.assertIn("窗口内不推", local_log)
+            # An explicit sync ignores the throttle and flushes it.
+            mh.sync_repo(repo_a)
+            remote_log = subprocess.run(["git", "log", "--oneline", "main"], cwd=bare,
+                                        text=True, capture_output=True).stdout
+            self.assertIn("窗口内不推", remote_log)
+
+    def test_context_auto_pulls_remote_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo_a, bare, repo_b = self._wire_remote(base)
+            self._set_sync(repo_a, push_throttle_seconds=0, pull_throttle_seconds=0)
+            mh.sync_repo(repo_a)
+            mh.remember(repo_a, "A写的可记事件", type_="event", source_client="A")
+            mh.maybe_auto_push(repo_a)
+
+            subprocess.run(["git", "clone", "-b", "main", str(bare), str(repo_b)], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._set_sync(repo_b, remote=str(bare), pull_throttle_seconds=0)
+            # build_context after an auto-pull should see A's memory.
+            mh.maybe_auto_pull(repo_b)
+            self.assertIn("A写的可记事件", mh.build_context(repo_b, pack="full"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -151,6 +151,8 @@ def init_repo(repo: Path, name: str = "user", role: str = "") -> None:
             "branch": "main",
             "auto_pull": True,
             "auto_push": True,
+            "push_throttle_seconds": 3600,
+            "pull_throttle_seconds": 3600,
             "pull_strategy": "rebase",
             "commit_prefix": "memhub:",
         },
@@ -1452,6 +1454,8 @@ def setup_git_sync(
         "remote_method": remote_method,
         "auto_pull": True,
         "auto_push": True,
+        "push_throttle_seconds": sync_cfg.get("push_throttle_seconds", 3600),
+        "pull_throttle_seconds": sync_cfg.get("pull_throttle_seconds", 3600),
         "pull_strategy": "rebase",
         "commit_prefix": "memhub:",
         "updated_at": now_iso(),
@@ -1657,14 +1661,37 @@ def _remote_has_branch(repo: Path, branch: str) -> bool:
     return bool(res.stdout.strip())
 
 
-def sync_repo(repo: Path) -> str:
-    ensure_repo(repo)
-    # Local git config isn't cloned, so register the structured merge driver on
-    # each machine before any pull --rebase might need it. Also backfill
-    # .gitattributes for repos created before merge support existed.
-    ensure_merge_driver_registered(repo)
-    if not (repo / ".gitattributes").exists():
-        write_text(repo / ".gitattributes", GITATTRIBUTES_CONTENT)
+def _sync_cache_path(repo: Path) -> Path:
+    # Per-machine, git-ignored. Throttle state must NOT be committed: it is local
+    # to each device and committing it would create cross-device merge churn.
+    return repo / ".memhub/cache/sync.yaml"
+
+
+def _read_sync_cache(repo: Path) -> dict[str, Any]:
+    return read_yaml(_sync_cache_path(repo), {}) or {}
+
+
+def _write_sync_cache(repo: Path, **updates: Any) -> None:
+    cache = _read_sync_cache(repo)
+    cache.update(updates)
+    write_yaml(_sync_cache_path(repo), cache)
+
+
+def _seconds_since(iso_ts: str | None) -> float:
+    """Seconds since an ISO timestamp, or +inf if missing/unparseable."""
+    if not iso_ts:
+        return float("inf")
+    try:
+        then = dt.datetime.fromisoformat(iso_ts)
+    except (ValueError, TypeError):
+        return float("inf")
+    now = dt.datetime.now(then.tzinfo) if then.tzinfo else dt.datetime.now()
+    return (now - then).total_seconds()
+
+
+def _sync_now(repo: Path, quiet: bool = False) -> str:
+    """Commit local changes, pull --rebase (if remote branch exists), then push.
+    Shared by the manual `sync` command and the throttled auto-sync helpers."""
     cfg = load_config(repo)
     sync = cfg.get("sync") or {}
     branch = sync.get("branch") or "main"
@@ -1677,7 +1704,7 @@ def sync_repo(repo: Path) -> str:
         state["last_sync_at"] = now_iso()
         write_yaml(repo / ".memhub/state.yaml", state)
         commit_all(repo, "memhub: update sync state")
-        return "".join(outputs)
+        return "" if quiet else "".join(outputs)
 
     # Commit local changes first so a pull --rebase has a clean tree to work on.
     commit_all(repo, "memhub: sync local changes")
@@ -1703,7 +1730,10 @@ def sync_repo(repo: Path) -> str:
                     "\nMemHub: pull failed (no conflict detected). Local memory is intact and NOT pushed. "
                     "Check the remote/credentials and re-run `memhub sync`.\n"
                 )
+            # Record the pull attempt so auto-pull doesn't hammer a broken remote.
+            _write_sync_cache(repo, last_pull_at=now_iso())
             return "".join(outputs)
+        _write_sync_cache(repo, last_pull_at=now_iso())
 
     state = read_yaml(repo / ".memhub/state.yaml", {}) or {}
     state["last_sync_at"] = now_iso()
@@ -1716,7 +1746,66 @@ def sync_repo(repo: Path) -> str:
             "\nMemHub: push failed. Local memory is committed but not on the remote. "
             "Check credentials/remote and re-run `memhub sync`.\n"
         )
-    return "".join(outputs)
+    else:
+        _write_sync_cache(repo, last_push_at=now_iso(), last_pull_at=now_iso())
+    return "" if quiet else "".join(outputs)
+
+
+def sync_repo(repo: Path) -> str:
+    ensure_repo(repo)
+    # Local git config isn't cloned, so register the structured merge driver on
+    # each machine before any pull --rebase might need it. Also backfill
+    # .gitattributes for repos created before merge support existed.
+    ensure_merge_driver_registered(repo)
+    if not (repo / ".gitattributes").exists():
+        write_text(repo / ".gitattributes", GITATTRIBUTES_CONTENT)
+    # Manual sync always runs immediately, ignoring throttle.
+    return _sync_now(repo, quiet=False)
+
+
+def maybe_auto_push(repo: Path) -> str:
+    """Auto-push after a write, throttled per-machine. Always a no-op-safe call:
+    skips silently when auto_push is off, no remote is set, or the throttle
+    window hasn't elapsed. Local memory is already committed by the caller."""
+    cfg = load_config(repo)
+    sync = cfg.get("sync") or {}
+    if not sync.get("auto_push", True):
+        return ""
+    if not (sync.get("remote") or run_git(repo, ["remote"], check=False).stdout.strip()):
+        return ""
+    throttle = float(sync.get("push_throttle_seconds", 3600) or 0)
+    if _seconds_since(_read_sync_cache(repo).get("last_push_at")) < throttle:
+        return ""  # within window — stay local, will push on a later write or manual sync
+    ensure_merge_driver_registered(repo)
+    return _sync_now(repo, quiet=True)
+
+
+def maybe_auto_pull(repo: Path) -> str:
+    """Auto-pull before a read, throttled per-machine. Returns a human-facing
+    warning string only when a pull was attempted and failed; empty otherwise."""
+    cfg = load_config(repo)
+    sync = cfg.get("sync") or {}
+    if not sync.get("auto_pull", True):
+        return ""
+    if not (sync.get("remote") or run_git(repo, ["remote"], check=False).stdout.strip()):
+        return ""
+    throttle = float(sync.get("pull_throttle_seconds", 3600) or 0)
+    if _seconds_since(_read_sync_cache(repo).get("last_pull_at")) < throttle:
+        return ""
+    branch = sync.get("branch") or "main"
+    ensure_merge_driver_registered(repo)
+    if not _remote_has_branch(repo, branch):
+        return ""
+    # Commit local edits first so rebase has a clean tree.
+    commit_all(repo, "memhub: sync local changes")
+    pull = run_git_auth(repo, ["pull", "--rebase", "origin", branch], check=False)
+    if pull.returncode != 0:
+        if (repo / ".git" / "rebase-merge").exists() or (repo / ".git" / "rebase-apply").exists():
+            run_git(repo, ["rebase", "--abort"], check=False)
+        _write_sync_cache(repo, last_pull_at=now_iso())
+        return "MemHub: 远端同步失败，当前上下文可能不是最新（使用本地记忆）。\n"
+    _write_sync_cache(repo, last_pull_at=now_iso())
+    return ""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1739,6 +1828,7 @@ def main(argv: list[str] | None = None) -> int:
     p_rem.add_argument("--source", default="manual")
     p_rem.add_argument("--project", default=None)
     p_rem.add_argument("--inbox", action="store_true", help="Capture into the inbox audit buffer instead of writing canonical memory")
+    p_rem.add_argument("--no-sync", action="store_true", help="Skip throttled auto-push for this write (stays local)")
 
     p_inbox = sub.add_parser("inbox", help="Inspect inbox items")
     inbox_sub = p_inbox.add_subparsers(dest="inbox_cmd", required=True)
@@ -1752,6 +1842,7 @@ def main(argv: list[str] | None = None) -> int:
     p_promote.add_argument("--dry-run", action="store_true", help="Preview only; this is the default unless --apply is set")
     p_promote.add_argument("--apply", action="store_true", help="Write canonical files and mark inbox items promoted")
     p_promote.add_argument("--status", default="pending", choices=["pending", "all"], help="Inbox status to scan when refs are omitted")
+    p_promote.add_argument("--no-sync", action="store_true", help="Skip throttled auto-push after applying (stays local)")
 
     p_export = sub.add_parser("export", help="Export context")
     p_export.add_argument("target", choices=["chatbot"])
@@ -1769,6 +1860,7 @@ def main(argv: list[str] | None = None) -> int:
     p_forget.add_argument("--type", default=None)
     p_forget.add_argument("--project", default=None)
     p_forget.add_argument("--apply", action="store_true", help="Archive matches; default is dry-run preview")
+    p_forget.add_argument("--no-sync", action="store_true", help="Skip throttled auto-push after archiving (stays local)")
 
     p_sync = sub.add_parser("sync", help="Configure or run GitHub/Gitee sync")
     sync_sub = p_sync.add_subparsers(dest="sync_cmd")
@@ -1809,9 +1901,16 @@ def main(argv: list[str] | None = None) -> int:
         init_repo(repo, name=args.name, role=args.role)
         print(f"Initialized MemHub repository: {repo}")
     elif args.cmd == "context":
+        warn = maybe_auto_pull(repo)
+        if warn:
+            print(warn, end="", file=sys.stderr)
         print(build_context(repo, project=args.project, pack=args.pack), end="")
     elif args.cmd == "remember":
         print(remember(repo, args.content, type_=args.type, source_client=args.source, project=args.project, to_inbox=args.inbox))
+        if not args.no_sync:
+            out = maybe_auto_push(repo)
+            if out.strip():
+                print(out, end="", file=sys.stderr)
     elif args.cmd == "inbox":
         if args.inbox_cmd == "list":
             print(inbox_list(repo, status=args.status), end="")
@@ -1820,6 +1919,10 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "promote":
         refs = args.refs if args.refs else None
         print(promote(repo, refs=refs, apply=args.apply, status=args.status), end="")
+        if args.apply and not args.no_sync:
+            out = maybe_auto_push(repo)
+            if out.strip():
+                print(out, end="", file=sys.stderr)
     elif args.cmd == "export":
         out = export_chatbot(repo, project=args.project)
         print(f"Exported chatbot context: {out}")
@@ -1827,6 +1930,10 @@ def main(argv: list[str] | None = None) -> int:
         print(search(repo, args.query, type_=args.type, project=args.project, limit=args.limit, include_archived=args.include_archived), end="")
     elif args.cmd == "forget":
         print(forget(repo, args.query, type_=args.type, project=args.project, apply=args.apply), end="")
+        if args.apply and not args.no_sync:
+            out = maybe_auto_push(repo)
+            if out.strip():
+                print(out, end="", file=sys.stderr)
     elif args.cmd == "sync":
         if getattr(args, "sync_cmd", None) == "setup":
             print(setup_git_sync(

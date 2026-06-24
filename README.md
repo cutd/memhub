@@ -26,6 +26,8 @@ python -m memhub_cli export chatbot --repo ./my-memhub
 python -m memhub_cli sync --repo ./my-memhub
 ```
 
-`remember` 默认直接写入 canonical 记忆并本地提交（不自动推送）；多条记忆累积后用一次
-`sync` 推送。`init`/`sync` 会注册一个结构化 Git merge 驱动，使多设备对同一记忆文件的并发追加
+`remember` 默认直接写入 canonical 记忆并本地提交。配置 remote 后，写入会自动推送、
+`context` 会自动拉取（均按小时级节流，可在 `.memhub/config.yaml` 调整），装了 skill 的
+Agent 无需每次手动 `sync`；显式 `sync` 则忽略节流、立即同步，适合会话收尾兜底。
+`init`/`sync` 会注册一个结构化 Git merge 驱动，使多设备对同一记忆文件的并发追加
 能自动合并而不冲突。

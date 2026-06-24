@@ -146,6 +146,8 @@ sync:
   account: <login>
   auto_pull: true
   auto_push: true
+  push_throttle_seconds: 3600
+  pull_throttle_seconds: 3600
   pull_strategy: rebase
   commit_prefix: 'memhub:'
 inbox:
@@ -311,6 +313,26 @@ Sync is plain Git. The reference flow (`memhub sync`):
 
 A brand-new remote with no branch yet skips the pull and pushes directly.
 
+### 8.0 Automatic, throttled sync
+
+A manual `sync` runs the flow above immediately. In addition, when a remote is
+configured, implementations SHOULD sync automatically so any agent with the
+skill installed stays in sync without explicit calls:
+
+- **After a write** (`remember`, `forget --apply`, `promote --apply`): attempt a
+  push, throttled by `sync.push_throttle_seconds` (default 3600). Within the
+  window the write is committed locally only; the push happens on a later write
+  or an explicit `sync`. Local memory is therefore never lost, and the remote is
+  not spammed with per-write pushes.
+- **Before a read** (`context`): attempt a `pull --rebase`, throttled by
+  `sync.pull_throttle_seconds` (default 3600). On failure, fall back to local
+  memory and warn that context may be stale.
+
+Auto behavior is gated by `sync.auto_push` / `sync.auto_pull` (default true). The
+throttle timestamps live in `.memhub/cache/sync.yaml`, which is **git-ignored and
+per-machine** — sync cadence is a local concern and committing it would create
+cross-device merge churn. An explicit `sync` always ignores the throttle.
+
 ### 8.1 Structured merge driver
 
 Canonical files are append-mostly YAML lists, so two devices that each append
@@ -348,19 +370,23 @@ explicit user request.
 
 ## 9. Agent behavior contract (informative)
 
-- **Before reading**: if the task needs long-term memory, `sync` then
-  `context --pack brief`. If sync fails, continue from local context but tell
-  the user it may be stale.
+- **Before reading**: just read `context` — it auto-pulls (throttled) when a
+  remote is configured. If the pull fails, it falls back to local memory and
+  warns that context may be stale. Run an explicit `sync` first only when you
+  need a guaranteed-fresh read.
 - **During**: when a stable decision/preference/fact forms, `remember` it
-  (direct write by default; `--inbox` to buffer for review).
+  (direct write by default; `--inbox` to buffer for review). The write
+  auto-pushes, throttled; no explicit `sync` is needed per write.
 - **Recall / curate**: `search <query>` matches canonical entries by content,
   type, or project. `forget <query>` soft-archives entries (sets
   `status: archived`) so they drop out of context packs but stay auditable and
   reversible in Git history. To correct a memory, `forget` the stale entry and
   `remember` the new one.
-- **Archiving**: `promote --dry-run`, confirm, then `promote --apply`, then
-  `sync`. Do not promote chit-chat, unconfirmed guesses, or sensitive data
-  without explicit consent.
+- **Archiving**: `promote --dry-run`, confirm, then `promote --apply`. Do not
+  promote chit-chat, unconfirmed guesses, or sensitive data without explicit
+  consent.
+- **At end of session**: run an explicit `sync` to flush any writes still held
+  by the push throttle.
 - **Never** echo tokens, secrets, or authorization codes.
 
 The normative agent-facing rules live in `skills/memhub/SKILL.md`.

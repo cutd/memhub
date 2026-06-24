@@ -1,6 +1,6 @@
 ---
 name: memhub
-version: 0.2.0
+version: 0.3.0
 description: 使用 MemHub Protocol v0.1 读写用户的跨 Agent 统一记忆仓库。当用户要求记住信息、检索/遗忘记忆、读取个人/项目上下文、生成 chatbot 注入文本、同步 Git 记忆仓库时使用。
 tags:
   - memory
@@ -123,17 +123,18 @@ python scripts/memhub.py --repo ~/memhub-data sync
 - `sync setup` 会触发授权、创建仓库、修改 remote；**只有用户明确要求配置/切换同步时才执行**。
 - OAuth/token/SSH 凭据、authorization code、client secret、access token 都属于敏感信息；不要在回答中复述。
 
-### 对话开始：读取前同步
+### 对话开始：读取上下文
 
-如果当前任务需要用户长期偏好、项目上下文或跨设备最新记忆，执行：
+如果当前任务需要用户长期偏好、项目上下文或跨设备最新记忆，直接读取 context 即可——
+`context` 会按节流阈值**自动从远端拉取**最新记忆，通常无需先手动 `sync`：
 
 ```bash
-python scripts/memhub.py --repo "$MEMHUB_REPO" sync
 python scripts/memhub.py --repo "$MEMHUB_REPO" context --pack brief
 ```
 
-- 如果 `sync` 成功，再使用 `context` 输出。
-- 如果 `sync` 失败，不要丢弃本地数据；可以继续读取本地 `context`，但必须告知用户“远端同步失败，当前上下文可能不是最新”。
+- 若距上次拉取超过 `pull_throttle_seconds`，`context` 会自动 `pull --rebase` 再输出。
+- 自动拉取失败时，CLI 会用本地记忆并在 stderr 提示“远端同步失败，当前上下文可能不是最新”，
+  无需中断；如需强制最新，可显式 `sync` 后再读。
 - 将 context 作为可审计上下文，不要当成绝对事实；遇到冲突时优先询问用户。
 
 ### 对话中：写入记忆
@@ -159,14 +160,25 @@ python scripts/memhub.py --repo "$MEMHUB_REPO" remember "内容" --type fact --s
 - `constraint`：约束
 - `convention`：惯例
 
-### 同步：批量、收尾一次推送
+### 同步：自动节流，无需每次手动 sync
 
-不要每记一条就 sync。在一段对话里累积多条记忆，**在对话收尾或用户要求时执行一次** `sync`
-把本地提交推送到远端：
+配置了 remote 后，同步是**自动**的，Agent 通常无需显式调用 `sync`：
+
+- **写入即同步（节流）**：每次 `remember` / `forget --apply` / `promote --apply` 后，CLI 会
+  自动尝试推送。距上次推送不足 `sync.push_throttle_seconds`（默认 3600 秒）时只在本地提交，
+  超过阈值才真正 pull+push。**记忆始终立即落本地，绝不丢失。**
+- **读取即拉取（节流）**：`context` 命令会在 `sync.pull_throttle_seconds`（默认 3600 秒）阈值外
+  自动 `pull --rebase` 拉取其它设备的最新记忆；拉取失败则用本地并在 stderr 提示可能不是最新。
+
+显式 `sync` 命令**忽略节流，立即** pull+push，适合在对话收尾兜底，确保本次所有记忆都已上远端：
 
 ```bash
 python scripts/memhub.py --repo "$MEMHUB_REPO" sync
 ```
+
+节流阈值与开关都在 `.memhub/config.yaml` 的 `sync` 段（`auto_push`/`auto_pull` /
+`push_throttle_seconds` / `pull_throttle_seconds`）；节流时间戳记在本机 `.memhub/cache/sync.yaml`
+（git 忽略，每台设备独立）。单次写入若想跳过自动推送，加 `--no-sync`。
 
 `init`/`sync` 会自动注册结构化 merge 驱动（local git config 不随 clone 走，故每台设备首次
 `sync` 会自愈补注册），多设备对同一记忆文件的并发追加可自动合并，不会冲突。
@@ -261,8 +273,9 @@ python scripts/memhub.py --repo "$MEMHUB_REPO" sync
 
 如果对话中产生重要决策、偏好或事实：
 
-1. `remember` 直写记忆（低置信内容用 `--inbox`，必要时 `promote`）。
-2. 执行一次 `sync` 推送本次会话累积的所有记忆。
+1. `remember` 直写记忆（低置信内容用 `--inbox`，必要时 `promote`）。写入时已按节流自动推送。
+2. 收尾执行一次显式 `sync`：它忽略节流、立即推送，确保本次会话即使在节流窗口内产生的
+   记忆也全部上远端（兜底，防止刚写完就关闭 Agent 导致最后几条只在本地）。
 
 ## 发布与安全约束
 

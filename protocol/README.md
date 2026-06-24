@@ -339,6 +339,13 @@ once. Implementations SHOULD offer a readiness check (the reference CLI's
 `doctor` command) that reports remote, credential, merge-driver, `MEMHUB_REPO`,
 and last-sync state with fix hints.
 
+**Concurrency.** Auto-sync assumes one writer process per local checkout at a
+time. Two processes writing the same checkout concurrently can collide on
+git's `index.lock`; the reference CLI does not serialize them. Cross-*device*
+concurrency is fine — that is what the merge driver handles. For multiple agents
+on one machine, point them at the same `MEMHUB_REPO` and avoid simultaneous
+writes, or give each its own checkout.
+
 ### 8.1 Structured merge driver
 
 Canonical files are append-mostly YAML lists, so two devices that each append

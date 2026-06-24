@@ -206,6 +206,25 @@ class AutoSyncTest(unittest.TestCase):
                                         text=True, capture_output=True).stdout
             self.assertIn("窗口内不推", remote_log)
 
+    def test_failed_push_advances_throttle(self) -> None:
+        # A broken remote must not be hammered on every write: even when push
+        # fails, the throttle window advances so the next write stays local.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            mh.init_repo(repo, name="A")
+            subprocess.run(["git", "remote", "add", "origin", str(Path(tmp) / "does-not-exist")],
+                           cwd=repo, check=True)
+            cfg = mh.load_config(repo)
+            cfg["sync"].update({"remote": str(Path(tmp) / "does-not-exist"),
+                                "push_throttle_seconds": 3600})
+            mh.save_config(repo, cfg)
+            mh.remember(repo, "推不上去", type_="fact", source_client="A")
+            mh.maybe_auto_push(repo)  # push fails (no such remote)
+            cache = mh.read_yaml(repo / ".memhub/cache/sync.yaml", {})
+            self.assertTrue(cache.get("last_push_at"), "failed push should still stamp last_push_at")
+            # Failed push must not falsely advance the pull clock.
+            self.assertFalse(cache.get("last_pull_at"))
+
     def test_context_auto_pulls_remote_memory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

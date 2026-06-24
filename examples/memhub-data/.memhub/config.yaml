@@ -8,6 +8,8 @@ sync:
   branch: main
   auto_pull: true
   auto_push: true
+  push_throttle_seconds: 3600
+  pull_throttle_seconds: 3600
   pull_strategy: rebase
   commit_prefix: 'memhub:'
 inbox:

@@ -1850,13 +1850,16 @@ def _sync_now(repo: Path, quiet: bool = False) -> str:
     commit_all(repo, "memhub: update sync state")
     push = run_git_auth(repo, ["push", "-u", "origin", f"HEAD:{branch}"], check=False)
     outputs.append(push.stdout + push.stderr)
+    # Record the push attempt either way: on failure this still advances the
+    # throttle window so a broken remote (e.g. missing token) isn't hammered on
+    # every single write. last_pull_at is only set where a pull actually ran
+    # (above), so a brand-new remote's first auto-pull isn't suppressed here.
+    _write_sync_cache(repo, last_push_at=now_iso())
     if push.returncode != 0:
         outputs.append(
             "\nMemHub: push failed. Local memory is committed but not on the remote. "
             "Check credentials/remote and re-run `memhub sync`.\n"
         )
-    else:
-        _write_sync_cache(repo, last_push_at=now_iso(), last_pull_at=now_iso())
     return "" if quiet else "".join(outputs)
 
 

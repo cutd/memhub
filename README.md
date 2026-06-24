@@ -16,16 +16,18 @@ It lets AI agents read and write a shared, human-auditable memory repository usi
 ## MVP Commands
 
 ```bash
-python -m memhub_cli init --repo ./my-memhub
-python -m memhub_cli context --repo ./my-memhub
-python -m memhub_cli remember --repo ./my-memhub "记住这个"          # 直写 canonical
-python -m memhub_cli remember --repo ./my-memhub "待确认" --inbox    # 进 inbox 审计缓冲
-python -m memhub_cli search --repo ./my-memhub "关键词"
-python -m memhub_cli forget --repo ./my-memhub "关键词" --apply       # 软归档
-python -m memhub_cli export chatbot --repo ./my-memhub
-python -m memhub_cli sync --repo ./my-memhub
-python -m memhub_cli doctor --repo ./my-memhub      # 自检自动同步是否就绪
+python -m memhub_cli --repo ./my-memhub init
+python -m memhub_cli --repo ./my-memhub context
+python -m memhub_cli --repo ./my-memhub remember "记住这个"          # 直写 canonical
+python -m memhub_cli --repo ./my-memhub remember "待确认" --inbox    # 进 inbox 审计缓冲
+python -m memhub_cli --repo ./my-memhub search "关键词"
+python -m memhub_cli --repo ./my-memhub forget "关键词" --apply       # 软归档
+python -m memhub_cli --repo ./my-memhub export chatbot
+python -m memhub_cli --repo ./my-memhub sync
+python -m memhub_cli --repo ./my-memhub doctor      # 自检自动同步是否就绪
 ```
+
+`--repo` 是全局参数，须放在子命令之前（也可改用环境变量 `MEMHUB_REPO` 省略它）。
 
 `remember` 默认直接写入 canonical 记忆并本地提交。配置 remote 后，写入会自动推送、
 `context` 会自动拉取（均按小时级节流，可在 `.memhub/config.yaml` 调整），装了 skill 的

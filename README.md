@@ -16,7 +16,7 @@ It lets AI agents read and write a shared, human-auditable memory repository usi
 ## MVP Commands
 
 ```bash
-python -m memhub_cli --repo ./my-memhub init
+python -m memhub_cli --repo ./my-memhub onboard gitee --repo-name mymemhub  # 首次接入：拉取或建仓
 python -m memhub_cli --repo ./my-memhub context
 python -m memhub_cli --repo ./my-memhub remember "记住这个"          # 直写 canonical
 python -m memhub_cli --repo ./my-memhub remember "待确认" --inbox    # 进 inbox 审计缓冲
@@ -26,6 +26,9 @@ python -m memhub_cli --repo ./my-memhub export chatbot
 python -m memhub_cli --repo ./my-memhub sync
 python -m memhub_cli --repo ./my-memhub doctor      # 自检自动同步是否就绪
 ```
+
+> 首次在新机器/新 agent 接入已有记忆仓库，**用 `onboard`**：它会探测远端，已有记忆则
+> 拉取为准（不播种默认数据），远端为空则初始化并推送。单机全新使用也可先 `init`。
 
 `--repo` 是全局参数，须放在子命令之前（也可改用环境变量 `MEMHUB_REPO` 省略它）。
 

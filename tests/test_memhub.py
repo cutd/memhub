@@ -295,5 +295,44 @@ class BrokerTest(unittest.TestCase):
         self.assertIsNone(mh._extract_broker_token({"status": "pending"}))
 
 
+class OnboardLogicTest(unittest.TestCase):
+    """Exercise the seed-vs-pull decision without going through real OAuth."""
+
+    def _bare(self, base: Path):
+        bare = base / "bare.git"
+        subprocess.run(["git", "init", "--bare", str(bare)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return bare
+
+    def test_remote_has_memory_detects_existing_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bare = self._bare(base)
+            # Seed a "device A" with memory and push to the bare remote.
+            a = base / "a"
+            mh.init_repo(a, name="A")
+            subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=a, check=True)
+            subprocess.run(["git", "push", "-u", "origin", "HEAD:main"], cwd=a, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Fresh "device B" pointed at the same remote should see memory.
+            b = base / "b"
+            b.mkdir()
+            subprocess.run(["git", "init", str(b)], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=b, check=True)
+            self.assertTrue(mh._remote_has_memory(b, "main"))
+
+    def test_remote_has_memory_false_on_empty_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            bare = self._bare(base)
+            b = base / "b"
+            b.mkdir()
+            subprocess.run(["git", "init", str(b)], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=b, check=True)
+            self.assertFalse(mh._remote_has_memory(b, "main"))
+
+
 if __name__ == "__main__":
     unittest.main()

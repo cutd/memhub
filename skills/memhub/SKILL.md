@@ -1,6 +1,6 @@
 ---
 name: memhub
-version: 0.4.2
+version: 0.4.3
 description: 使用 MemHub Protocol v0.1 读写用户的跨 Agent 统一记忆仓库。当用户要求记住信息、检索/遗忘记忆、读取个人/项目上下文、生成 chatbot 注入文本、同步 Git 记忆仓库时使用。
 tags:
   - memory
@@ -100,7 +100,11 @@ python scripts/memhub.py --repo ~/memhub-data promote <filename-or-id-fragment> 
 # 导出给 chatbot 的上下文
 python scripts/memhub.py --repo ~/memhub-data export chatbot
 
-# 同步 GitHub/Gitee（默认 OAuth；发布版应内置 GitHub/Gitee OAuth app 配置）
+# 首次接入（推荐）：授权 + 自动判断拉取已有记忆 / 初始化新仓库
+python scripts/memhub.py --repo ~/memhub-data onboard github --repo-name mymemhub
+python scripts/memhub.py --repo ~/memhub-data onboard gitee  --repo-name mymemhub
+
+# 同步 GitHub/Gitee（手动分步；默认 OAuth 走内置 broker）
 python scripts/memhub.py --repo ~/memhub-data sync setup github --repo-name mymemhub
 python scripts/memhub.py --repo ~/memhub-data sync setup gitee --repo-name mymemhub
 python scripts/memhub.py --repo ~/memhub-data sync setup github --auth token --repo-name mymemhub
@@ -220,9 +224,33 @@ python scripts/memhub.py --repo "$MEMHUB_REPO" forget "过时内容" --apply   #
   消失但保留在 Git 历史中，可审计、可回滚。
 - 纠正一条记忆 = `forget` 旧条目 + `remember` 新条目。
 
-### 同步 setup：只有用户明确要求时执行
+### 首次接入：用 onboard（推荐）
 
-当用户说“配置同步”、“连接 GitHub/Gitee”、“换成 Gitee/GitHub 同步”时，才执行 setup。
+新 agent / 新机器第一次接入时，**用 `onboard` 一条命令完成全流程**，它会自动判断该
+"拉取已有记忆"还是"初始化新仓库"，避免用默认数据污染你已有的真实记忆：
+
+```bash
+python scripts/memhub.py --repo "$MEMHUB_REPO" onboard gitee --repo-name mymemhub
+python scripts/memhub.py --repo "$MEMHUB_REPO" onboard github --repo-name mymemhub
+```
+
+onboard 的流程：
+
+1. 授权（默认走内置 broker，见下）。
+2. **探测远端**是否已有 MemHub 记忆仓库（含 `.memhub/config.yaml`）：
+   - **已有** → 以远端为准拉取到本地，**不写入任何默认数据**（你的真实记忆直接到位）；
+   - **为空** → 初始化默认记忆并推送，建立远端仓库。
+3. 注册 merge 驱动、确保 auto-sync 就绪。
+4. 打印 `doctor` 自检结果。
+
+之后写入即自动推送、读取即自动拉取，无需再手动 sync。新机器换设备时**总是优先用
+onboard**，不要先 `init` 再 `sync setup`（那会先播种默认数据，可能污染远端真实记忆）。
+
+### 同步 setup：手动分步配置（高级）
+
+`onboard` 内部会调用 setup。只有当你想单独配置/切换 remote、且明确知道本地数据状态时，
+才直接用 `sync setup`。当用户说“配置同步”、“连接 GitHub/Gitee”、“换成 Gitee/GitHub 同步”时，
+优先用 `onboard`。
 
 **开箱即用**：GitHub 和 Gitee 都默认走内置的 MemHub Auth Broker（`https://oauth.1024hub.cn`），
 client_secret 保管在 broker 服务端，**用户无需设置任何环境变量或自建 OAuth 应用**。

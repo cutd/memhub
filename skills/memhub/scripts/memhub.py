@@ -1579,6 +1579,125 @@ def setup_git_sync(
     ]) + "\n"
 
 
+def _remote_has_memory(repo: Path, branch: str) -> bool:
+    """True if the remote branch already contains a MemHub repo (has
+    .memhub/config.yaml). Used to decide seed-vs-pull on first onboarding."""
+    if not _remote_has_branch(repo, branch):
+        return False
+    # ls-tree against the remote ref without checking anything out.
+    run_git_auth(repo, ["fetch", "origin", branch], check=False)
+    res = run_git(repo, ["ls-tree", "-r", "--name-only", f"origin/{branch}"], check=False)
+    files = res.stdout.splitlines()
+    return any(f == ".memhub/config.yaml" for f in files)
+
+
+def onboard(
+    repo: Path,
+    provider: str,
+    repo_name: str,
+    *,
+    name: str = "user",
+    role: str = "",
+    owner: str | None = None,
+    branch: str = "main",
+    private: bool = True,
+    auth_method: str = "oauth",
+    no_browser: bool = False,
+    broker_url: str | None = None,
+) -> str:
+    """First-run onboarding for a new agent/machine.
+
+    1. Authorize and configure the remote (no seeding yet).
+    2. If the remote already holds a MemHub repo, pull it as the source of
+       truth — do NOT seed local defaults (which would pollute real memory).
+    3. Otherwise seed a fresh repo (init defaults) and push to establish it.
+    4. Register the merge driver and report readiness.
+    """
+    repo.mkdir(parents=True, exist_ok=True)
+    ensure_repo(repo)
+
+    # Configure remote + credentials. create_repo=True is idempotent: it creates
+    # the remote if missing, or continues if it already exists.
+    setup_msg = setup_git_sync(
+        repo,
+        provider=provider,
+        repo_name=repo_name,
+        owner=owner,
+        branch=branch,
+        private=private,
+        create_repo=True,
+        auth_method=auth_method,
+        remote_method="https" if auth_method in {"oauth", "token"} else "ssh",
+        no_browser=no_browser,
+        broker_url=broker_url,
+    )
+
+    outputs = [setup_msg.rstrip(), ""]
+
+    if _remote_has_memory(repo, branch):
+        # Remote is the source of truth on a fresh onboarding. The local repo
+        # only holds the setup config/secret commit, so align hard to the remote
+        # rather than risk an "unrelated histories" rebase conflict. We avoid
+        # writing .gitattributes first so there are no untracked-file collisions.
+        outputs.append("检测到远端已有记忆仓库 → 以远端为准，拉取到本地（不写入默认数据）。")
+        run_git_auth(repo, ["fetch", "origin", branch], check=False)
+        reset = run_git(repo, ["reset", "--hard", f"origin/{branch}"], check=False)
+        outputs.append((reset.stdout + reset.stderr).strip())
+        # Re-assert our sync config/credentials + merge driver on top of the
+        # pulled tree (the remote tree may predate these).
+        ensure_merge_driver_registered(repo)
+        if not (repo / ".gitattributes").exists():
+            write_text(repo / ".gitattributes", GITATTRIBUTES_CONTENT)
+        _reassert_sync_config(repo, provider, owner, repo_name, branch, auth_method)
+        _write_sync_cache(repo, last_pull_at=now_iso())
+        outputs.append("\n本地记忆已与远端同步。")
+    else:
+        # Brand-new remote: seed defaults, then push to establish it.
+        outputs.append("远端为空 → 初始化默认记忆并推送，建立远端仓库。")
+        ensure_merge_driver_registered(repo)
+        if not (repo / "identity/profile.yaml").exists():
+            init_repo(repo, name=name, role=role)
+            # init_repo rewrites config without sync details; restore them.
+            _reassert_sync_config(repo, provider, owner, repo_name, branch, auth_method)
+        if not (repo / ".gitattributes").exists():
+            write_text(repo / ".gitattributes", GITATTRIBUTES_CONTENT)
+            commit_all(repo, "memhub: add gitattributes")
+        push = run_git_auth(repo, ["push", "-u", "origin", f"HEAD:{branch}"], check=False)
+        outputs.append((push.stdout + push.stderr).strip())
+        _write_sync_cache(repo, last_push_at=now_iso(), last_pull_at=now_iso())
+        outputs.append("\n默认记忆已建立并推送到远端。")
+
+    outputs.append("")
+    outputs.append(doctor(repo))
+    return "\n".join(outputs) + "\n"
+
+
+def _reassert_sync_config(repo: Path, provider: str, owner: str | None, repo_name: str, branch: str, auth_method: str) -> None:
+    """Restore MemHub sync config + remote after a pull/seed may have changed
+    the working tree, without re-running authorization."""
+    secrets = load_secrets(repo)
+    account = ((secrets.get("sync") or {}).get(provider) or {}).get("account") or owner or ""
+    owner = owner or account
+    remote = remote_url(provider, owner, repo_name, method="https" if auth_method in {"oauth", "token"} else "ssh")
+    run_git(repo, ["remote", "remove", "origin"], check=False)
+    run_git(repo, ["remote", "add", "origin", remote], check=False)
+    cfg = load_config(repo)
+    sync_cfg = cfg.setdefault("sync", {})
+    sync_cfg.update({
+        "backend": "git", "type": "git", "provider": provider, "remote": remote,
+        "repo": f"{owner}/{repo_name}", "branch": branch, "auth_method": auth_method,
+        "remote_method": "https" if auth_method in {"oauth", "token"} else "ssh",
+        "auto_pull": True, "auto_push": True,
+        "push_throttle_seconds": sync_cfg.get("push_throttle_seconds", 3600),
+        "pull_throttle_seconds": sync_cfg.get("pull_throttle_seconds", 3600),
+        "pull_strategy": "rebase", "commit_prefix": "memhub:", "updated_at": now_iso(),
+    })
+    if account:
+        sync_cfg["account"] = account
+    save_config(repo, cfg)
+    commit_all(repo, f"memhub: configure {provider} sync")
+
+
 def sync_status(repo: Path) -> str:
     cfg = load_config(repo)
     sync = cfg.get("sync") or {}
@@ -2112,6 +2231,18 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("doctor", help="Diagnose whether automatic memory sync is ready")
 
+    p_onboard = sub.add_parser("onboard", help="First-run setup: authorize, then pull remote memory or seed+push a new repo")
+    p_onboard.add_argument("provider", choices=["github", "gitee"])
+    p_onboard.add_argument("--repo-name", default="mymemhub", help="Remote repository name")
+    p_onboard.add_argument("--name", default="user", help="User name to seed when the remote is empty")
+    p_onboard.add_argument("--role", default="", help="User role to seed when the remote is empty")
+    p_onboard.add_argument("--owner", default=None, help="Owner/login. Defaults to authenticated account")
+    p_onboard.add_argument("--branch", default="main")
+    p_onboard.add_argument("--public", action="store_true", help="Create public repo instead of private")
+    p_onboard.add_argument("--auth", default="oauth", choices=["oauth", "token", "ssh"], help="Git auth mode")
+    p_onboard.add_argument("--no-browser", action="store_true", help="Print OAuth URL but do not open a browser")
+    p_onboard.add_argument("--broker-url", default=None, help="Override the MemHub Auth Broker base URL")
+
     p_merge = sub.add_parser("merge-driver", help=argparse.SUPPRESS)
     p_merge.add_argument("base")
     p_merge.add_argument("ours")
@@ -2190,6 +2321,20 @@ def main(argv: list[str] | None = None) -> int:
             print(sync_repo(repo), end="")
     elif args.cmd == "doctor":
         print(doctor(repo), end="")
+    elif args.cmd == "onboard":
+        print(onboard(
+            repo,
+            provider=args.provider,
+            repo_name=args.repo_name,
+            name=args.name,
+            role=args.role,
+            owner=args.owner,
+            branch=args.branch,
+            private=not args.public,
+            auth_method=args.auth,
+            no_browser=args.no_browser,
+            broker_url=args.broker_url,
+        ), end="")
     return 0
 
 

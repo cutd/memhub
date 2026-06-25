@@ -389,6 +389,13 @@ explicit user request.
 
 ## 9. Agent behavior contract (informative)
 
+- **First run (onboarding)**: on a new machine/agent, run `onboard <provider>`
+  rather than `init` + `sync setup`. It authorizes, then detects whether the
+  remote already holds a MemHub repo: if so it pulls the remote as the source of
+  truth and does NOT seed local defaults (which would pollute real memory); if
+  the remote is empty it seeds defaults and pushes. This avoids the seed-then-
+  collide failure mode of initializing fresh local memory against a remote that
+  already has the user's real memory.
 - **Before reading**: just read `context` — it auto-pulls (throttled) when a
   remote is configured. If the pull fails, it falls back to local memory and
   warns that context may be stale. Run an explicit `sync` first only when you
